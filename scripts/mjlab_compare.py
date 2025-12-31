@@ -1,0 +1,847 @@
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
+
+import torch
+from rsl_rl.runners import OnPolicyRunner
+
+# Register IRB2400 task(s) into mjlab's registry.
+import mjlab_irb2400  # noqa: F401
+import mjlab_irb2400_v1  # noqa: F401
+
+from mjlab.envs import ManagerBasedRlEnv
+from mjlab.rl import RslRlVecEnvWrapper
+from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
+from mjlab.utils.torch import configure_torch_backends
+from mjlab.utils.wrappers import VideoRecorder
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--task", type=str, default="Mjlab-JointGain-ABB-IRB2400")
+    p.add_argument("--checkpoint", type=str, default="", help="Path to model_*.pt for --task")
+    p.add_argument("--ff-task", type=str, default="Mjlab-JointGainFF-ABB-IRB2400")
+    p.add_argument("--ff-checkpoint", type=str, default="", help="Optional model_*.pt for --ff-task")
+    p.add_argument("--device", type=str, default="", help="e.g. cuda:0 or cpu")
+    p.add_argument("--num-envs", type=int, default=1024)
+    p.add_argument("--episodes", type=int, default=5)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--seeds",
+        type=str,
+        default="",
+        help="Comma-separated seeds (overrides --seed), e.g. '0,1,2,3,4'",
+    )
+
+    p.add_argument(
+        "--baseline",
+        type=str,
+        default="offset",
+        choices=["offset", "custom", "trained_mean"],
+        help=(
+            "Baseline fixed gains: 'offset' uses action offsets; 'custom' uses --baseline-kp/--baseline-kd; "
+            "'trained_mean' uses per-joint mean gains observed from the trained policy."
+        ),
+    )
+    p.add_argument("--baseline-kp", type=float, default=220.0)
+    p.add_argument("--baseline-kd", type=float, default=40.0)
+
+    p.add_argument("--out", type=str, default="compare/irb2400_gain_compare.json")
+    p.add_argument("--video", action="store_true", help="Record videos (num_envs forced to 1)")
+    p.add_argument("--video-length", type=int, default=200)
+    p.add_argument("--video-height", type=int, default=480)
+    p.add_argument("--video-width", type=int, default=640)
+    p.add_argument(
+        "--skip-steps",
+        type=int,
+        default=20,
+        help="Skip the first N steps of each episode when computing error metrics (removes reset transient).",
+    )
+    return p.parse_args()
+
+
+class ConstantActionPolicy:
+    def __init__(self, action: torch.Tensor):
+        self._action = action
+
+    def __call__(self, obs) -> torch.Tensor:  # noqa: ANN001 - rsl_rl style
+        del obs
+        return self._action
+
+
+def _resolve_device(cli_device: str) -> str:
+    if cli_device:
+        return cli_device
+    return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
+def _load_trained_policy(
+    *, task_id: str, checkpoint: Path, env: RslRlVecEnvWrapper, device: str
+):
+    agent_cfg = load_rl_cfg(task_id)
+    runner_cls = load_runner_cls(task_id) or OnPolicyRunner
+    runner = runner_cls(env, asdict(agent_cfg), device=device)
+    runner.load(str(checkpoint), map_location=device)
+    return runner.get_inference_policy(device=device)
+
+
+def _make_env(
+    *,
+    task_id: str,
+    device: str,
+    num_envs: int,
+    seed: int,
+    video: bool,
+    video_folder: Path | None,
+    video_length: int,
+    video_height: int,
+    video_width: int,
+) -> RslRlVecEnvWrapper:
+    env_cfg = load_env_cfg(task_id, play=True)
+    env_cfg.seed = seed
+    env_cfg.scene.num_envs = num_envs
+    env_cfg.viewer.height = video_height
+    env_cfg.viewer.width = video_width
+
+    render_mode = "rgb_array" if video else None
+    env = ManagerBasedRlEnv(cfg=env_cfg, device=device, render_mode=render_mode)
+
+    if video:
+        assert video_folder is not None
+        env = VideoRecorder(
+            env,
+            video_folder=video_folder,
+            step_trigger=lambda step: step == 0,
+            video_length=video_length,
+            disable_logger=True,
+        )
+
+    agent_cfg = load_rl_cfg(task_id)
+    return RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+
+
+def _episode_logs_from_extras(extras: dict[str, Any]) -> dict[str, float]:
+    log = extras.get("log", {})
+    if not isinstance(log, dict):
+        return {}
+    out: dict[str, float] = {}
+    for k, v in log.items():
+        if isinstance(v, (float, int)):
+            out[k] = float(v)
+        elif isinstance(v, torch.Tensor):
+            # RewardManager returns scalar tensors; TerminationManager returns ints.
+            if v.numel() == 1:
+                out[k] = float(v.item())
+    return out
+
+
+def _run_eval(
+    *,
+    env: RslRlVecEnvWrapper,
+    policy,
+    episodes: int,
+    device: str,
+    skip_steps: int = 0,
+) -> list[dict[str, float]]:
+    logs: list[dict[str, float]] = []
+
+    # Guard against skipping the whole episode (common when switching tasks with different episode length).
+    # Ensure we still accumulate at least 1 step of metrics per episode.
+    if env.max_episode_length <= 0:
+        raise RuntimeError(f"Invalid env.max_episode_length={env.max_episode_length}")
+    if skip_steps >= env.max_episode_length:
+        new_skip = max(0, env.max_episode_length - 1)
+        print(
+            f"[WARN] skip_steps ({skip_steps}) >= episode length ({env.max_episode_length}); "
+            f"clamping skip_steps to {new_skip}",
+            flush=True,
+        )
+        skip_steps = new_skip
+
+    obs = env.get_observations()
+    env.unwrapped.command_manager.compute(dt=env.unwrapped.step_dt)
+
+    robot = env.unwrapped.scene["robot"]
+    if robot.data.default_joint_pos is None:
+        raise RuntimeError("robot.data.default_joint_pos is required for joint error metrics.")
+
+    # End-effector site (entity-local) for EE error evaluation.
+    ee_site_ids, _ = robot.find_sites("ee", preserve_order=True)
+    if not ee_site_ids:
+        raise RuntimeError("Could not find site named 'ee' on robot entity.")
+    if len(ee_site_ids) != 1:
+        raise RuntimeError(f"Expected exactly one 'ee' site, got {ee_site_ids}")
+    ee_site_id = int(ee_site_ids[0])
+
+    try:
+        import mujoco_warp as mjwarp  # type: ignore
+    except Exception:  # pragma: no cover - depends on runtime environment
+        mjwarp = None
+
+    def _mjwarp_update_kinematics() -> None:
+        """Update positions needed for site_xpos without triggering camlight."""
+        if mjwarp is None:
+            return
+        # Prefer kinematics() since fwd_position() calls camlight() and can break on some builds.
+        if hasattr(mjwarp, "kinematics"):
+            mjwarp.kinematics(model, data)
+        else:  # pragma: no cover
+            # Fall back to fwd_position if kinematics is unavailable.
+            mjwarp.fwd_position(model, data)
+
+    # Per-step accumulation for "true" joint tracking error.
+    # Each episode contains `env.num_envs` parallel rollouts; we report mean over envs.
+    num_joints = int(robot.data.joint_pos.shape[1])
+    sum_abs = torch.zeros((env.num_envs, num_joints), device=device)
+    sum_sq = torch.zeros_like(sum_abs)
+    max_abs = torch.zeros_like(sum_abs)
+    steps = torch.zeros((env.num_envs, 1), device=device)
+
+    # Per-step accumulation for end-effector position tracking error (meters).
+    ee_sum = torch.zeros((env.num_envs, 1), device=device)
+    ee_sum_sq = torch.zeros_like(ee_sum)
+    ee_max = torch.zeros_like(ee_sum)
+
+    # Physical smoothness metrics (independent of reward weights).
+    sum_vel_sq = torch.zeros_like(sum_abs)
+    sum_acc_sq = torch.zeros_like(sum_abs)
+    prev_vel = robot.data.joint_vel.clone()
+    dt = float(env.unwrapped.step_dt)
+
+    action_dim = int(env.unwrapped.action_manager.total_action_dim)
+    cfg_actions = getattr(env.unwrapped.cfg, "actions", {})
+    has_pd_gains = "pd_gains" in cfg_actions
+    has_pd_gains_ff = "pd_gains_ff" in cfg_actions
+    has_torque_action = "joint_torque" in cfg_actions
+
+    update_every_env_steps = 1
+    if has_pd_gains or has_pd_gains_ff:
+        term_cfg = env.unwrapped.cfg.actions["pd_gains"] if has_pd_gains else env.unwrapped.cfg.actions["pd_gains_ff"]
+        if hasattr(term_cfg, "update_period_s"):
+            update_every_env_steps = max(
+                1, int(round(float(getattr(term_cfg, "update_period_s")) / float(env.unwrapped.step_dt)))
+            )
+
+    held_action_for_stats = None
+
+    # Always define these to avoid UnboundLocalError in mixed task comparisons.
+    ff_tau_steps = 0
+    ff_tau_abs_sum = None
+    ff_tau_abs_max = None
+
+    # Gain stats (what the actuator actually sees after clamping/mapping) for the gain-scheduling task.
+    if has_pd_gains or has_pd_gains_ff:
+        pd_cfg = env.unwrapped.cfg.actions["pd_gains"] if has_pd_gains else env.unwrapped.cfg.actions["pd_gains_ff"]
+        kp_scale = float(getattr(pd_cfg, "kp_scale"))
+        kp_offset = float(getattr(pd_cfg, "kp_offset"))
+        kd_scale = float(getattr(pd_cfg, "kd_scale"))
+        kd_offset = float(getattr(pd_cfg, "kd_offset"))
+        clip_kp = tuple(getattr(pd_cfg, "clip_kp"))
+        clip_kd = tuple(getattr(pd_cfg, "clip_kd"))
+
+        dof = int(env.unwrapped.scene["robot"].data.joint_pos.shape[1])
+        gain_steps = 0
+        kp_sum = torch.zeros((env.num_envs, dof), device=device)
+        kd_sum = torch.zeros_like(kp_sum)
+        kp_min = torch.full_like(kp_sum, float("inf"))
+        kd_min = torch.full_like(kd_sum, float("inf"))
+        kp_max = torch.full_like(kp_sum, float("-inf"))
+        kd_max = torch.full_like(kd_sum, float("-inf"))
+        if has_pd_gains_ff:
+            ff_tau_steps = 0
+            ff_tau_abs_sum = torch.zeros((env.num_envs, dof), device=device)
+            ff_tau_abs_max = torch.zeros_like(ff_tau_abs_sum)
+    else:
+        kp_scale = kp_offset = kd_scale = kd_offset = None
+        clip_kp = clip_kd = None
+        dof = None
+        gain_steps = 0
+        kp_sum = kd_sum = kp_min = kd_min = kp_max = kd_max = None
+
+    # Torque stats for the torque-control task.
+    if has_torque_action:
+        torque_steps = 0
+        torque_abs_sum = torch.zeros((env.num_envs, action_dim), device=device)
+        torque_abs_max = torch.zeros_like(torque_abs_sum)
+    else:
+        torque_steps = 0
+        torque_abs_sum = torque_abs_max = None
+
+    for _ in range(episodes):
+        # Run exactly one full episode worth of steps; env auto-resets on time_out.
+        for _step in range(env.max_episode_length):
+            with torch.no_grad():
+                actions = policy(obs)
+            obs, _rew, dones, extras = env.step(actions)
+
+            # "True" tracking error metrics (skip early transient right after reset).
+            cmd = env.unwrapped.command_manager.get_command("joint_pos")
+            q = robot.data.joint_pos
+            q0 = robot.data.default_joint_pos
+            if _step >= skip_steps:
+                err = (q - q0) - cmd
+                abs_err = torch.abs(err)
+                sum_abs += abs_err
+                sum_sq += err * err
+                max_abs = torch.maximum(max_abs, abs_err)
+                steps += 1.0
+
+            # End-effector position error w.r.t. reference joint command.
+            if mjwarp is not None and _step >= skip_steps:
+                ee_pos = robot.data.site_pos_w[:, ee_site_id, :]
+                q_ref = q0 + cmd
+                joint_q_adr = robot.data.indexing.joint_q_adr
+                data = robot.data.data
+                model = robot.data.model
+                # Compute reference FK at q_ref.
+                data.qpos[:, joint_q_adr] = q_ref
+                _mjwarp_update_kinematics()
+                ee_ref = robot.data.site_pos_w[:, ee_site_id, :]
+                # Restore FK at actual q for subsequent dynamics.
+                data.qpos[:, joint_q_adr] = q
+                _mjwarp_update_kinematics()
+
+                ee_err = torch.linalg.norm(ee_pos - ee_ref, dim=-1, keepdim=True)
+                ee_sum += ee_err
+                ee_sum_sq += ee_err * ee_err
+                ee_max = torch.maximum(ee_max, ee_err)
+
+            # Smoothness metrics from state.
+            vel = robot.data.joint_vel
+            acc = (vel - prev_vel) / dt
+            prev_vel = vel.clone()
+            if _step >= skip_steps:
+                sum_vel_sq += vel * vel
+                sum_acc_sq += acc * acc
+
+            # Gain stats from actions (mirror of JointPdGainAction mapping).
+            if held_action_for_stats is None:
+                held_action_for_stats = actions.clone()
+            if (_step % update_every_env_steps) == 0:
+                held_action_for_stats = actions.clone()
+            a = torch.clamp(held_action_for_stats, -1.0, 1.0)
+            if has_pd_gains:
+                assert dof is not None
+                kp_raw = a[:, :dof]
+                kd_raw = a[:, dof:]
+                kp = torch.clamp(kp_raw * kp_scale + kp_offset, clip_kp[0], clip_kp[1])
+                kd = torch.clamp(kd_raw * kd_scale + kd_offset, clip_kd[0], clip_kd[1])
+                kp_sum += kp
+                kd_sum += kd
+                kp_min = torch.minimum(kp_min, kp)
+                kd_min = torch.minimum(kd_min, kd)
+                kp_max = torch.maximum(kp_max, kp)
+                kd_max = torch.maximum(kd_max, kd)
+                gain_steps += 1
+
+            if has_pd_gains_ff:
+                assert dof is not None
+                # Support multiple "pd_gains_ff" action layouts:
+                # - Legacy (4*dof): [kp, kd, a, b] used for simple friction residual tau_res
+                # - v1 (3*dof): [kp, kd, tau_ff] direct feedforward torque
+                kp_raw = a[:, :dof]
+                kd_raw = a[:, dof : 2 * dof]
+                kp = torch.clamp(kp_raw * kp_scale + kp_offset, clip_kp[0], clip_kp[1])
+                kd = torch.clamp(kd_raw * kd_scale + kd_offset, clip_kd[0], clip_kd[1])
+                kp_sum += kp
+                kd_sum += kd
+                kp_min = torch.minimum(kp_min, kp)
+                kd_min = torch.minimum(kd_min, kd)
+                kp_max = torch.maximum(kp_max, kp)
+                kd_max = torch.maximum(kd_max, kd)
+                gain_steps += 1
+
+                assert ff_tau_abs_sum is not None and ff_tau_abs_max is not None
+                if a.shape[1] == 3 * dof:
+                    tau_raw = a[:, 2 * dof : 3 * dof]
+                    tau_scale = float(getattr(pd_cfg, "tau_scale", 1.0))
+                    tau_limit = float(getattr(pd_cfg, "tau_limit", float("inf")))
+                    tau_ff = torch.clamp(tau_raw * tau_scale, -tau_limit, tau_limit)
+                    abs_tau = torch.abs(tau_ff)
+                    ff_tau_abs_sum += abs_tau
+                    ff_tau_abs_max = torch.maximum(ff_tau_abs_max, abs_tau)
+                    ff_tau_steps += 1
+                elif a.shape[1] == 4 * dof:
+                    a_raw = a[:, 2 * dof : 3 * dof]
+                    b_raw = a[:, 3 * dof : 4 * dof]
+                    tau_limit = float(getattr(pd_cfg, "tau_limit"))
+                    a_max = float(getattr(pd_cfg, "a_max"))
+                    b_max = float(getattr(pd_cfg, "b_max"))
+                    sign_eps = float(getattr(pd_cfg, "sign_eps", 0.05))
+                    a_mag = 0.5 * (a_raw + 1.0) * a_max
+                    b_mag = 0.5 * (b_raw + 1.0) * b_max
+                    qd = robot.data.joint_vel[:, :dof]
+                    sign = torch.tanh(qd / sign_eps)
+                    tau_res = a_mag * sign + b_mag * qd
+                    tau_res = torch.clamp(tau_res, -tau_limit, tau_limit)
+                    abs_tau = torch.abs(tau_res)
+                    ff_tau_abs_sum += abs_tau
+                    ff_tau_abs_max = torch.maximum(ff_tau_abs_max, abs_tau)
+                    ff_tau_steps += 1
+                else:
+                    # Unknown layout; skip FF magnitude metrics (keep gain stats).
+                    pass
+
+            if has_torque_action:
+                tau = a
+                abs_tau = torch.abs(tau)
+                assert torque_abs_sum is not None and torque_abs_max is not None
+                torque_abs_sum += abs_tau
+                torque_abs_max = torch.maximum(torque_abs_max, abs_tau)
+                torque_steps += 1
+
+            # All envs time out together in this task; treat as episode boundary.
+            if int(dones.sum().item()) == env.num_envs:
+                ep = _episode_logs_from_extras(extras)
+
+                if float(steps.max().item()) <= 0.0:
+                    raise RuntimeError(
+                        f"No samples accumulated for metrics (skip_steps={skip_steps} >= episode length?)"
+                    )
+                mae_per_joint = (sum_abs / steps).mean(dim=0)
+                rmse_per_joint = torch.sqrt(sum_sq / steps).mean(dim=0)
+                max_abs_per_joint = max_abs.mean(dim=0)
+
+                ep["JointError/mae_mean_rad"] = float(mae_per_joint.mean().item())
+                ep["JointError/rmse_mean_rad"] = float(rmse_per_joint.mean().item())
+                ep["JointError/max_abs_mean_rad"] = float(max_abs_per_joint.mean().item())
+
+                ep["JointError/per_joint_mae_rad"] = [float(x) for x in mae_per_joint.tolist()]
+                ep["JointError/per_joint_rmse_rad"] = [float(x) for x in rmse_per_joint.tolist()]
+                ep["JointError/per_joint_max_abs_rad"] = [
+                    float(x) for x in max_abs_per_joint.tolist()
+                ]
+
+                if mjwarp is not None:
+                    ee_mae_m = (ee_sum / steps).mean()
+                    ee_rmse_m = torch.sqrt(ee_sum_sq / steps).mean()
+                    ee_max_m = ee_max.mean()
+                    ep["EEError/mae_mm"] = float(ee_mae_m.item() * 1000.0)
+                    ep["EEError/rmse_mm"] = float(ee_rmse_m.item() * 1000.0)
+                    ep["EEError/max_mm"] = float(ee_max_m.item() * 1000.0)
+
+                vel_rms_per_joint = torch.sqrt((sum_vel_sq / steps).mean(dim=0))
+                acc_rms_per_joint = torch.sqrt((sum_acc_sq / steps).mean(dim=0))
+                ep["JointDyn/vel_rms_mean_rad_s"] = float(vel_rms_per_joint.mean().item())
+                ep["JointDyn/acc_rms_mean_rad_s2"] = float(acc_rms_per_joint.mean().item())
+
+                if gain_steps > 0:
+                    kp_mean = (kp_sum / float(gain_steps)).mean(dim=0)
+                    kd_mean = (kd_sum / float(gain_steps)).mean(dim=0)
+                    ep["Gain/kp_mean"] = float(kp_mean.mean().item())
+                    ep["Gain/kp_min"] = float(kp_min.mean().item())
+                    ep["Gain/kp_max"] = float(kp_max.mean().item())
+                    ep["Gain/kd_mean"] = float(kd_mean.mean().item())
+                    ep["Gain/kd_min"] = float(kd_min.mean().item())
+                    ep["Gain/kd_max"] = float(kd_max.mean().item())
+                    ep["Gain/per_joint_kp_mean"] = [float(x) for x in kp_mean.tolist()]
+                    ep["Gain/per_joint_kd_mean"] = [float(x) for x in kd_mean.tolist()]
+
+                if ff_tau_steps > 0:
+                    assert ff_tau_abs_sum is not None and ff_tau_abs_max is not None
+                    tau_abs_mean = (ff_tau_abs_sum / float(ff_tau_steps)).mean(dim=0)
+                    tau_abs_max_mean = ff_tau_abs_max.mean(dim=0)
+                    ep["FF/abs_mean"] = float(tau_abs_mean.mean().item())
+                    ep["FF/abs_max_mean"] = float(tau_abs_max_mean.mean().item())
+                    ep["FF/per_joint_abs_mean"] = [float(x) for x in tau_abs_mean.tolist()]
+                    ep["FF/per_joint_abs_max"] = [float(x) for x in tau_abs_max_mean.tolist()]
+
+                if torque_steps > 0:
+                    assert torque_abs_sum is not None and torque_abs_max is not None
+                    tau_abs_mean = (torque_abs_sum / float(torque_steps)).mean(dim=0)
+                    tau_abs_max_mean = torque_abs_max.mean(dim=0)
+                    ep["Torque/abs_mean"] = float(tau_abs_mean.mean().item())
+                    ep["Torque/abs_max_mean"] = float(tau_abs_max_mean.mean().item())
+                    ep["Torque/per_joint_abs_mean"] = [float(x) for x in tau_abs_mean.tolist()]
+                    ep["Torque/per_joint_abs_max"] = [float(x) for x in tau_abs_max_mean.tolist()]
+
+                logs.append(ep)
+
+                # Reset accumulators for next episode.
+                sum_abs.zero_()
+                sum_sq.zero_()
+                max_abs.zero_()
+                steps.zero_()
+                ee_sum.zero_()
+                ee_sum_sq.zero_()
+                ee_max.zero_()
+                sum_vel_sq.zero_()
+                sum_acc_sq.zero_()
+                prev_vel = robot.data.joint_vel.clone()
+
+                gain_steps = 0
+                if has_pd_gains or has_pd_gains_ff:
+                    kp_sum.zero_()
+                    kd_sum.zero_()
+                    kp_min.fill_(float("inf"))
+                    kd_min.fill_(float("inf"))
+                    kp_max.fill_(float("-inf"))
+                    kd_max.fill_(float("-inf"))
+                if has_pd_gains_ff:
+                    ff_tau_steps = 0
+                    assert ff_tau_abs_sum is not None and ff_tau_abs_max is not None
+                    ff_tau_abs_sum.zero_()
+                    ff_tau_abs_max.zero_()
+
+                torque_steps = 0
+                if has_torque_action:
+                    assert torque_abs_sum is not None and torque_abs_max is not None
+                    torque_abs_sum.zero_()
+                    torque_abs_max.zero_()
+                break
+
+    return logs
+
+
+def _summarize(episode_logs: list[dict[str, float]]) -> dict[str, float]:
+    if not episode_logs:
+        return {}
+    keys = sorted({k for d in episode_logs for k in d.keys()})
+    summary: dict[str, float] = {}
+    for k in keys:
+        vals = [d[k] for d in episode_logs if k in d]
+        if not vals:
+            continue
+        # Skip non-scalar metrics (e.g. per-joint lists).
+        if not all(isinstance(v, (float, int)) for v in vals):
+            continue
+        summary[f"{k}/mean"] = float(sum(vals) / len(vals))
+        summary[f"{k}/min"] = float(min(vals))
+        summary[f"{k}/max"] = float(max(vals))
+    return summary
+
+
+def _parse_seeds(args: argparse.Namespace) -> list[int]:
+    if args.seeds:
+        return [int(x.strip()) for x in args.seeds.split(",") if x.strip()]
+    return [int(args.seed)]
+
+
+def main() -> None:
+    args = _parse_args()
+    configure_torch_backends()
+
+    task_id = args.task
+    device = _resolve_device(args.device)
+    out_path = Path(args.out).expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    seeds = _parse_seeds(args)
+    if not seeds:
+        raise SystemExit("No seeds provided.")
+
+    if args.video:
+        args.num_envs = 1
+        if len(seeds) > 1:
+            print("[WARN] --video with multiple seeds: recording only the first seed.")
+            seeds = seeds[:1]
+
+    ckpt = Path(args.checkpoint).expanduser().resolve() if args.checkpoint else None
+    if ckpt is None or not ckpt.exists():
+        raise SystemExit("--checkpoint is required and must exist (e.g. .../model_999.pt)")
+    ff_ckpt = Path(args.ff_checkpoint).expanduser().resolve() if args.ff_checkpoint else None
+    if ff_ckpt is not None and not ff_ckpt.exists():
+        raise SystemExit("--ff-checkpoint must exist when provided.")
+
+    per_seed: list[dict[str, Any]] = []
+    all_baseline_logs: list[dict[str, float]] = []
+    all_trained_logs: list[dict[str, float]] = []
+    all_ff_logs: list[dict[str, float]] = []
+
+    # Cache baseline mapping parameters from the first env (they are task config constants).
+    kp_scale = kp_offset = kd_scale = kd_offset = None
+    baseline_per_joint_kp: list[float] | None = None
+    baseline_per_joint_kd: list[float] | None = None
+
+    for seed in seeds:
+        # Ensure determinism of command sampling as much as possible.
+        torch.manual_seed(seed)
+
+        trained_logs: list[dict[str, float]] = []
+        baseline_logs: list[dict[str, float]] = []
+
+        if args.baseline == "trained_mean":
+            # Run trained policy first to estimate per-joint mean gains for a fair fixed-gain baseline.
+            trained_video_dir = (
+                out_path.parent / "videos" / "trained" if args.video else None
+            )
+            trained_env = _make_env(
+                task_id=task_id,
+                device=device,
+                num_envs=args.num_envs,
+                seed=seed,
+                video=args.video,
+                video_folder=trained_video_dir,
+                video_length=args.video_length,
+                video_height=args.video_height,
+                video_width=args.video_width,
+            )
+            trained_policy = _load_trained_policy(
+                task_id=task_id, checkpoint=ckpt, env=trained_env, device=device
+            )
+            trained_logs = _run_eval(
+                env=trained_env,
+                policy=trained_policy,
+                episodes=args.episodes,
+                device=device,
+            )
+
+            pd_cfg = trained_env.unwrapped.cfg.actions["pd_gains"]
+            kp_scale = float(getattr(pd_cfg, "kp_scale"))
+            kp_offset = float(getattr(pd_cfg, "kp_offset"))
+            kd_scale = float(getattr(pd_cfg, "kd_scale"))
+            kd_offset = float(getattr(pd_cfg, "kd_offset"))
+
+            kp_means = [
+                d.get("Gain/per_joint_kp_mean")
+                for d in trained_logs
+                if isinstance(d.get("Gain/per_joint_kp_mean"), list)
+            ]
+            kd_means = [
+                d.get("Gain/per_joint_kd_mean")
+                for d in trained_logs
+                if isinstance(d.get("Gain/per_joint_kd_mean"), list)
+            ]
+            if not kp_means or not kd_means:
+                raise RuntimeError("Expected Gain/per_joint_*_mean in trained logs.")
+            dof = len(kp_means[0])
+            baseline_per_joint_kp = [
+                float(sum(v[i] for v in kp_means) / len(kp_means)) for i in range(dof)
+            ]
+            baseline_per_joint_kd = [
+                float(sum(v[i] for v in kd_means) / len(kd_means)) for i in range(dof)
+            ]
+            trained_env.close()
+
+            # Re-seed so baseline command sampling is comparable.
+            torch.manual_seed(seed)
+
+            baseline_video_dir = (
+                out_path.parent / "videos" / "baseline" if args.video else None
+            )
+            baseline_env = _make_env(
+                task_id=task_id,
+                device=device,
+                num_envs=args.num_envs,
+                seed=seed,
+                video=args.video,
+                video_folder=baseline_video_dir,
+                video_length=args.video_length,
+                video_height=args.video_height,
+                video_width=args.video_width,
+            )
+            action_dim = baseline_env.unwrapped.action_manager.total_action_dim
+            dof = action_dim // 2
+            if baseline_per_joint_kp is None or baseline_per_joint_kd is None:
+                raise RuntimeError("Failed to compute trained_mean baseline gains.")
+            if len(baseline_per_joint_kp) != dof or len(baseline_per_joint_kd) != dof:
+                raise RuntimeError(
+                    f"Baseline gain DOF mismatch: got {len(baseline_per_joint_kp)} expected {dof}"
+                )
+
+            kp_raw_vec = torch.tensor(
+                [(k - kp_offset) / kp_scale for k in baseline_per_joint_kp],
+                device=device,
+                dtype=torch.float32,
+            ).clamp(-1.0, 1.0)
+            kd_raw_vec = torch.tensor(
+                [(k - kd_offset) / kd_scale for k in baseline_per_joint_kd],
+                device=device,
+                dtype=torch.float32,
+            ).clamp(-1.0, 1.0)
+
+            baseline_action = torch.zeros((baseline_env.num_envs, action_dim), device=device)
+            baseline_action[:, :dof] = kp_raw_vec[None, :]
+            baseline_action[:, dof:] = kd_raw_vec[None, :]
+            baseline_policy = ConstantActionPolicy(baseline_action)
+            baseline_logs = _run_eval(
+                env=baseline_env,
+                policy=baseline_policy,
+                episodes=args.episodes,
+                device=device,
+                skip_steps=int(args.skip_steps),
+            )
+            baseline_env.close()
+
+        else:
+            baseline_video_dir = (
+                out_path.parent / "videos" / "baseline" if args.video else None
+            )
+            baseline_env = _make_env(
+                task_id=task_id,
+                device=device,
+                num_envs=args.num_envs,
+                seed=seed,
+                video=args.video,
+                video_folder=baseline_video_dir,
+                video_length=args.video_length,
+                video_height=args.video_height,
+                video_width=args.video_width,
+            )
+
+            pd_cfg = baseline_env.unwrapped.cfg.actions["pd_gains"]
+            kp_scale = float(getattr(pd_cfg, "kp_scale"))
+            kp_offset = float(getattr(pd_cfg, "kp_offset"))
+            kd_scale = float(getattr(pd_cfg, "kd_scale"))
+            kd_offset = float(getattr(pd_cfg, "kd_offset"))
+
+            if args.baseline == "custom":
+                kp_raw = (float(args.baseline_kp) - kp_offset) / kp_scale
+                kd_raw = (float(args.baseline_kd) - kd_offset) / kd_scale
+                kp_raw = float(max(-1.0, min(1.0, kp_raw)))
+                kd_raw = float(max(-1.0, min(1.0, kd_raw)))
+            else:
+                kp_raw, kd_raw = 0.0, 0.0
+
+            action_dim = baseline_env.unwrapped.action_manager.total_action_dim
+            dof = action_dim // 2
+            baseline_action = torch.zeros((baseline_env.num_envs, action_dim), device=device)
+            baseline_action[:, :dof] = kp_raw
+            baseline_action[:, dof:] = kd_raw
+            baseline_policy = ConstantActionPolicy(baseline_action)
+
+            baseline_logs = _run_eval(
+                env=baseline_env,
+                policy=baseline_policy,
+                episodes=args.episodes,
+                device=device,
+            )
+            baseline_env.close()
+
+            # Trained env/policy (re-seed so command sampling matches baseline)
+            torch.manual_seed(seed)
+
+            trained_video_dir = out_path.parent / "videos" / "trained" if args.video else None
+            trained_env = _make_env(
+                task_id=task_id,
+                device=device,
+                num_envs=args.num_envs,
+                seed=seed,
+                video=args.video,
+                video_folder=trained_video_dir,
+                video_length=args.video_length,
+                video_height=args.video_height,
+                video_width=args.video_width,
+            )
+
+            trained_policy = _load_trained_policy(
+                task_id=task_id, checkpoint=ckpt, env=trained_env, device=device
+            )
+            trained_logs = _run_eval(
+                env=trained_env,
+                policy=trained_policy,
+                episodes=args.episodes,
+                device=device,
+                skip_steps=int(args.skip_steps),
+            )
+            trained_env.close()
+
+        ff_logs: list[dict[str, float]] = []
+        if ff_ckpt is not None:
+            torch.manual_seed(seed)
+            ff_env = _make_env(
+                task_id=args.ff_task,
+                device=device,
+                num_envs=args.num_envs,
+                seed=seed,
+                video=False,
+                video_folder=None,
+                video_length=args.video_length,
+                video_height=args.video_height,
+                video_width=args.video_width,
+            )
+            ff_policy = _load_trained_policy(
+                task_id=args.ff_task, checkpoint=ff_ckpt, env=ff_env, device=device
+            )
+            ff_logs = _run_eval(
+                env=ff_env,
+                policy=ff_policy,
+                episodes=args.episodes,
+                device=device,
+                skip_steps=int(args.skip_steps),
+            )
+            ff_env.close()
+
+        all_baseline_logs.extend(baseline_logs)
+        all_trained_logs.extend(trained_logs)
+        all_ff_logs.extend(ff_logs)
+        entry: dict[str, Any] = {
+            "seed": int(seed),
+            "baseline": {"episode_logs": baseline_logs, "summary": _summarize(baseline_logs)},
+            "trained": {"episode_logs": trained_logs, "summary": _summarize(trained_logs)},
+        }
+        if ff_ckpt is not None:
+            entry["ff"] = {"episode_logs": ff_logs, "summary": _summarize(ff_logs)}
+        per_seed.append(entry)
+
+    payload = {
+        "task": task_id,
+        "checkpoint": str(ckpt),
+        "ff_task": args.ff_task,
+        "ff_checkpoint": str(ff_ckpt) if ff_ckpt is not None else "",
+        "seeds": [int(s) for s in seeds],
+        "num_envs": int(args.num_envs),
+        "episodes": int(args.episodes),
+        "baseline": {
+            "mode": args.baseline,
+            "kp": float(args.baseline_kp),
+            "kd": float(args.baseline_kd),
+            "kp_scale": float(kp_scale) if kp_scale is not None else None,
+            "kp_offset": float(kp_offset) if kp_offset is not None else None,
+            "kd_scale": float(kd_scale) if kd_scale is not None else None,
+            "kd_offset": float(kd_offset) if kd_offset is not None else None,
+            "per_joint_kp": baseline_per_joint_kp,
+            "per_joint_kd": baseline_per_joint_kd,
+            "episode_logs": all_baseline_logs,
+            "summary": _summarize(all_baseline_logs),
+        },
+        "trained": {
+            "episode_logs": all_trained_logs,
+            "summary": _summarize(all_trained_logs),
+        },
+        "ff": {"episode_logs": all_ff_logs, "summary": _summarize(all_ff_logs)}
+        if ff_ckpt is not None
+        else {},
+        "per_seed": per_seed,
+    }
+
+    out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    print(f"[OK] wrote {out_path}")
+    print("\nBaseline summary (selected):")
+    for k in sorted(payload["baseline"]["summary"].keys()):
+        if k.endswith("/mean") and any(
+            s in k for s in ("Episode_Reward", "Episode_Termination", "JointError", "JointDyn", "Gain", "EEError")
+        ):
+            print(f"  {k}: {payload['baseline']['summary'][k]:.4f}")
+    print("\nTrained summary (selected):")
+    for k in sorted(payload["trained"]["summary"].keys()):
+        if k.endswith("/mean") and any(
+            s in k
+            for s in ("Episode_Reward", "Episode_Termination", "JointError", "JointDyn", "Gain", "Torque", "EEError")
+        ):
+            print(f"  {k}: {payload['trained']['summary'][k]:.4f}")
+    if ff_ckpt is not None:
+        print("\nGain+FF summary (selected):")
+        for k in sorted(payload["ff"]["summary"].keys()):
+            if k.endswith("/mean") and any(
+                s in k
+                for s in (
+                    "Episode_Reward",
+                    "Episode_Termination",
+                    "JointError",
+                    "JointDyn",
+                    "Gain",
+                    "Torque",
+                    "EEError",
+                )
+            ):
+                print(f"  {k}: {payload['ff']['summary'][k]:.4f}")
+
+
+if __name__ == "__main__":
+    main()

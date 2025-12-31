@@ -1,0 +1,15 @@
+{
+  "note": "Recovered from compare/irb2400_gain_compare.json. This snapshot pins the three-way comparison inputs so results stay reproducible.",
+  "task": "Mjlab-JointGain-ABB-IRB2400",
+  "checkpoint": "logs/rsl_rl/irb2400_joint_gain/2025-12-27_23-38-43/model_499.pt",
+  "ff_task": "Mjlab-JointGainFF-ABB-IRB2400",
+  "ff_checkpoint": "logs/rsl_rl/irb2400_joint_gain_ff/2025-12-27_23-41-53/model_499.pt",
+  "num_envs": 1024,
+  "episodes": 5,
+  "seeds": [0, 1, 2, 3, 4],
+  "baseline": {
+    "mode": "offset"
+  },
+  "skip_steps": 500
+}
+

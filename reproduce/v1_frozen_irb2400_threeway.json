@@ -1,0 +1,15 @@
+{
+  "note": "Frozen task IDs that won't drift with mjlab_irb2400 experiments. Checkpoints are the original v1-trained models.",
+  "task": "MjlabV1-JointGain-ABB-IRB2400",
+  "checkpoint": "logs/rsl_rl/irb2400_joint_gain/2025-12-27_23-38-43/model_499.pt",
+  "ff_task": "MjlabV1-JointGainFF-ABB-IRB2400",
+  "ff_checkpoint": "logs/rsl_rl/irb2400_joint_gain_ff/2025-12-27_23-41-53/model_499.pt",
+  "num_envs": 1024,
+  "episodes": 5,
+  "seeds": [0, 1, 2, 3, 4],
+  "baseline": {
+    "mode": "trained_mean"
+  },
+  "skip_steps": 50,
+  "out": "compare/v1_frozen_irb2400_threeway.json"
+}

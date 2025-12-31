@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+env/
+.cache/
+wandb/
+logs/**
+# Keep the two v1 checkpoints/configs needed to reproduce the "threeway" result.
+!logs/rsl_rl/irb2400_joint_gain/2025-12-27_23-38-43/**
+!logs/rsl_rl/irb2400_joint_gain_ff/2025-12-27_23-41-53/**
+
+compare/**
+# Keep the key comparison artifacts.
+!compare/irb2400_gain_compare.json
+!compare/v1_frozen_irb2400_threeway.json
+MUJOCO_LOG.TXT
+*.mp4
+.DS_Store

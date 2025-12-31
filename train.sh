@@ -1,0 +1,2 @@
+MUJOCO_GL=egl CUDA_VISIBLE_DEVICES=0 python -m scripts.mjlab_train Mjlab-JointGain-ABB-IRB2400 --env.scene.num-envs 4096
+MUJOCO_GL=egl CUDA_VISIBLE_DEVICES=0 python -m scripts.mjlab_train Mjlab-JointGainFF-ABB-IRB2400 --env.scene.num-envs 4096

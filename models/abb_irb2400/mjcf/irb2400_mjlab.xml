@@ -1,0 +1,49 @@
+<mujoco model="abb_irb2400">
+  <compiler angle="radian" meshdir="../meshes/collision"/>
+  <size njmax="64" nconmax="64"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="implicitfast"/>
+
+  <default>
+    <joint damping="1.0" armature="0.05"/>
+    <geom type="mesh" contype="0" conaffinity="0"/>
+  </default>
+
+  <asset>
+    <mesh name="base_link" content_type="model/stl" file="base_link.stl"/>
+    <mesh name="link_1" content_type="model/stl" file="link_1.stl"/>
+    <mesh name="link_2_whole" content_type="model/stl" file="link_2_whole.stl"/>
+    <mesh name="link_3" content_type="model/stl" file="link_3.stl"/>
+    <mesh name="link_4" content_type="model/stl" file="link_4.stl"/>
+    <mesh name="link_5" content_type="model/stl" file="link_5.stl"/>
+    <mesh name="link_6" content_type="model/stl" file="link_6.stl"/>
+  </asset>
+
+  <worldbody>
+    <geom rgba="0.737255 0.34902 0.160784 1" mesh="base_link"/>
+    <body name="link_1">
+      <joint name="joint_1" axis="0 0 1" range="-3.1416 3.1416"/>
+      <geom rgba="0.737255 0.34902 0.160784 1" mesh="link_1"/>
+      <body name="link_2" pos="0.1 0 0.615">
+        <joint name="joint_2" axis="0 1 0" range="-1.7453 1.9199"/>
+        <geom rgba="0.737255 0.34902 0.160784 1" mesh="link_2_whole"/>
+        <body name="link_3" pos="0 0 0.705">
+          <joint name="joint_3" axis="0 1 0" range="-1.0472 1.1345"/>
+          <geom rgba="0.737255 0.34902 0.160784 1" mesh="link_3"/>
+          <body name="link_4" pos="0.258 0 0.135">
+            <joint name="joint_4" axis="1 0 0" range="-3.49 3.49"/>
+            <geom rgba="0.737255 0.34902 0.160784 1" mesh="link_4"/>
+            <body name="link_5" pos="0.497 0 0">
+              <joint name="joint_5" axis="0 1 0" range="-2.0944 2.0944"/>
+              <geom rgba="0.737255 0.34902 0.160784 1" mesh="link_5"/>
+              <body name="link_6" pos="0.085 0 0">
+                <joint name="joint_6" axis="1 0 0" range="-6.9813 6.9813"/>
+                <geom rgba="0.188235 0.196078 0.203922 1" mesh="link_6"/>
+                <site name="ee" pos="0 0 0" size="0.02"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

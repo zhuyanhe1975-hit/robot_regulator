@@ -1,0 +1,61 @@
+<mujoco model="six_dof_chain">
+  <compiler angle="radian" inertiafromgeom="true"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+
+  <default>
+    <geom type="capsule" size="0.03" rgba="0.2 0.2 0.2 1"/>
+    <joint type="hinge" damping="0.2" armature="0.02" limited="true"/>
+    <motor ctrllimited="true" ctrlrange="-120 120"/>
+  </default>
+
+  <worldbody>
+    <light pos="0 0 2" dir="0 0 -1"/>
+    <body name="base" pos="0 0 0">
+      <geom type="box" size="0.12 0.12 0.06" rgba="0.4 0.4 0.4 1"/>
+
+      <body name="link1" pos="0 0 0.08">
+        <joint name="j1" axis="0 0 1" range="-3.1416 3.1416"/>
+        <geom fromto="0 0 0  0 0 0.25" />
+
+        <body name="link2" pos="0 0 0.25">
+          <joint name="j2" axis="0 1 0" range="-2.4 2.4"/>
+          <geom fromto="0 0 0  0.25 0 0" />
+
+          <body name="link3" pos="0.25 0 0">
+            <joint name="j3" axis="0 1 0" range="-2.4 2.4"/>
+            <geom fromto="0 0 0  0.25 0 0" />
+
+            <body name="link4" pos="0.25 0 0">
+              <joint name="j4" axis="1 0 0" range="-3.1416 3.1416"/>
+              <geom fromto="0 0 0  0 0 0.22" />
+
+              <body name="link5" pos="0 0 0.22">
+                <joint name="j5" axis="0 1 0" range="-2.1 2.1"/>
+                <geom fromto="0 0 0  0.18 0 0" />
+
+                <body name="link6" pos="0.18 0 0">
+                  <joint name="j6" axis="1 0 0" range="-3.1416 3.1416"/>
+                  <geom fromto="0 0 0  0.16 0 0" />
+
+                  <body name="ee" pos="0.16 0 0">
+                    <geom type="sphere" size="0.04" rgba="0.8 0.2 0.2 1"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor name="a1" joint="j1"/>
+    <motor name="a2" joint="j2"/>
+    <motor name="a3" joint="j3"/>
+    <motor name="a4" joint="j4"/>
+    <motor name="a5" joint="j5"/>
+    <motor name="a6" joint="j6"/>
+  </actuator>
+</mujoco>
+
