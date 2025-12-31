@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import warnings
 from typing import TYPE_CHECKING
 
 import torch
@@ -35,6 +36,15 @@ class JointPdGainFfActionV1(ActionTerm):
         self._raw_actions = torch.zeros(self.num_envs, self.action_dim, device=self.device)
         self._prev_cmd = torch.zeros(self.num_envs, self._num_joints, device=self.device)
         self._prev_tau_ff = torch.zeros(self.num_envs, self._num_joints, device=self.device)
+        self._tau_acc_hold = torch.zeros(self.num_envs, self._num_joints, device=self.device)
+        self._physics_step = 0
+        self._warned_acc = False
+
+        self._acc_update_steps = 1
+        if float(getattr(cfg, "acc_update_period_s", 0.0)) > 0.0:
+            self._acc_update_steps = max(
+                1, int(round(float(cfg.acc_update_period_s) / float(env.physics_dt)))
+            )
 
         self._pd_act: IdealPdActuator | None = None
         for act in self._asset.actuators:
@@ -61,11 +71,13 @@ class JointPdGainFfActionV1(ActionTerm):
         else:
             self._prev_cmd[env_ids] = cmd[env_ids][:, self._joint_ids]
             self._prev_tau_ff[env_ids] = 0.0
+            self._tau_acc_hold[env_ids] = 0.0
 
     def process_actions(self, actions: torch.Tensor) -> None:
         self._raw_actions[:] = actions
 
     def apply_actions(self) -> None:
+        self._physics_step += 1
         # Targets from command.
         cmd_term = self._env.command_manager.get_term(self.cfg.command_name)
         cmd = cmd_term.command
@@ -103,50 +115,101 @@ class JointPdGainFfActionV1(ActionTerm):
         self._prev_tau_ff = tau_ff.detach()
 
         tau_id = self._bias_feedforward()
-        self._asset.set_joint_effort_target(tau_id + tau_ff, joint_ids=self._joint_ids)
+
+        # Acceleration feedforward (M(q) qdd_ref) computed at a lower rate and held (e.g. 10ms).
+        tau_acc = torch.zeros_like(tau_id)
+        use_acc_ff = bool(getattr(self.cfg, "use_acc_feedforward", False))
+        acc_scale = float(getattr(self.cfg, "acc_scale", 0.0))
+        if use_acc_ff and abs(acc_scale) > 0.0:
+            if (self._physics_step % self._acc_update_steps) == 0:
+                qdd_ref = None
+                if hasattr(cmd_term, "command_acc"):
+                    qdd_ref = getattr(cmd_term, "command_acc")[:, self._joint_ids]
+                self._tau_acc_hold = self._acc_feedforward(qdd_ref).detach()
+            tau_acc = self._tau_acc_hold
+
+        self._asset.set_joint_effort_target(tau_id + tau_acc + tau_ff, joint_ids=self._joint_ids)
 
     def _bias_feedforward(self) -> torch.Tensor:
         if not self.cfg.use_inverse_dynamics:
             return torch.zeros((self.num_envs, self._num_joints), device=self.device)
 
         data = self._asset.data.data
+        idx_v = self._asset.data.indexing.joint_v_adr[self._joint_ids]
+
+        # Fast path: MuJoCo forward pass already updates bias forces (qfrc_bias) every physics step,
+        # so we can use it directly and keep inverse dynamics in the 2ms loop without extra kernels.
+        qfrc_bias = getattr(data, "qfrc_bias", None)
+        if qfrc_bias is not None:
+            tau = qfrc_bias[:, idx_v]
+        else:
+            # Fallback for older/odd builds where qfrc_bias isn't exposed.
+            tau = torch.zeros((self.num_envs, self._num_joints), device=self.device)
+
+        tau = tau * float(self.cfg.id_scale)
+        tau = torch.clamp(tau, -float(self.cfg.id_limit), float(self.cfg.id_limit))
+        return tau
+
+    def _acc_feedforward(self, qdd_ref: torch.Tensor | None) -> torch.Tensor:
+        if qdd_ref is None:
+            return torch.zeros((self.num_envs, self._num_joints), device=self.device)
+
+        data = self._asset.data.data
         model = self._asset.data.model
         idx_v = self._asset.data.indexing.joint_v_adr[self._joint_ids]
 
-        tau = torch.zeros((self.num_envs, self._num_joints), device=self.device)
+        tau_acc = torch.zeros((self.num_envs, self._num_joints), device=self.device)
         try:
             import mujoco_warp as mjwarp  # type: ignore
 
             model_struct = getattr(model, "struct", model)
             data_struct = getattr(data, "struct", data)
 
-            # Evaluate bias at current state with qacc=0.
             qacc0 = data.qacc[:, idx_v].clone()
-            data.qacc[:, idx_v] = 0.0
+            try:
+                data.qacc[:, idx_v] = qdd_ref
 
-            if hasattr(mjwarp, "kinematics"):
-                mjwarp.kinematics(model_struct, data_struct)
-            if hasattr(mjwarp, "com_pos"):
-                mjwarp.com_pos(model_struct, data_struct)
-            if hasattr(mjwarp, "com_vel"):
-                mjwarp.com_vel(model_struct, data_struct)
-            if hasattr(mjwarp, "rne"):
-                try:
-                    mjwarp.rne(model_struct, data_struct, flg_acc=True)
-                except TypeError:
-                    mjwarp.rne(model_struct, data_struct)
+                if hasattr(mjwarp, "kinematics"):
+                    mjwarp.kinematics(model_struct, data_struct)
+                if hasattr(mjwarp, "com_pos"):
+                    mjwarp.com_pos(model_struct, data_struct)
+                if hasattr(mjwarp, "com_vel"):
+                    mjwarp.com_vel(model_struct, data_struct)
 
-            qfrc_bias = getattr(data, "qfrc_bias", None)
-            if qfrc_bias is not None:
-                tau = qfrc_bias[:, idx_v]
+                if hasattr(mjwarp, "inverse"):
+                    mjwarp.inverse(model_struct, data_struct)
+                elif hasattr(mjwarp, "rne"):
+                    try:
+                        mjwarp.rne(model_struct, data_struct, flg_acc=True)
+                    except TypeError:
+                        mjwarp.rne(model_struct, data_struct)
 
-            data.qacc[:, idx_v] = qacc0
-        except Exception:
-            tau.zero_()
+                qfrc_inverse = getattr(data, "qfrc_inverse", None)
+                qfrc_bias = getattr(data, "qfrc_bias", None)
+                if qfrc_inverse is not None and qfrc_bias is not None:
+                    tau_acc = qfrc_inverse[:, idx_v] - qfrc_bias[:, idx_v]
+            finally:
+                data.qacc[:, idx_v] = qacc0
+        except ModuleNotFoundError:
+            if not self._warned_acc:
+                warnings.warn(
+                    "JointPdGainFfActionV1: mujoco_warp not available; acc feedforward disabled.",
+                    stacklevel=2,
+                )
+                self._warned_acc = True
+            tau_acc.zero_()
+        except Exception as e:
+            if not self._warned_acc:
+                warnings.warn(
+                    f"JointPdGainFfActionV1: acc feedforward failed ({type(e).__name__}: {e}); disabled.",
+                    stacklevel=2,
+                )
+                self._warned_acc = True
+            tau_acc.zero_()
 
-        tau = tau * float(self.cfg.id_scale)
-        tau = torch.clamp(tau, -float(self.cfg.id_limit), float(self.cfg.id_limit))
-        return tau
+        tau_acc = tau_acc * float(getattr(self.cfg, "acc_scale", 1.0))
+        tau_acc = torch.clamp(tau_acc, -float(getattr(self.cfg, "acc_limit", 0.0)), float(getattr(self.cfg, "acc_limit", 0.0)))
+        return tau_acc
 
 
 @dataclass(kw_only=True)
@@ -170,5 +233,10 @@ class JointPdGainFfActionV1Cfg(ActionTermCfg):
     id_scale: float = 1.0
     id_limit: float = 800.0
 
-    class_type: type[ActionTerm] = JointPdGainFfActionV1
+    # Acceleration feedforward (M(q) qdd_ref) computed via inverse dynamics and held.
+    use_acc_feedforward: bool = False
+    acc_update_period_s: float = 0.01
+    acc_scale: float = 1.0
+    acc_limit: float = 800.0
 
+    class_type: type[ActionTerm] = JointPdGainFfActionV1

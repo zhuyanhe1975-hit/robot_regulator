@@ -21,7 +21,8 @@ from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.tasks.velocity.mdp import reset_joints_by_offset
 from mjlab.viewer import ViewerConfig
 
-from mjlab_irb2400_v1.mdp import joint_pd_gain_action, joint_sine_command, joint_tracking_rewards
+from mjlab_irb2400_v1.mdp import joint_sine_command, joint_tracking_rewards
+from mjlab_irb2400_ctres.mdp.joint_ctres_action import JointCtResActionCfg
 
 COULOMB_FRICTION = 2.0
 VISCOUS_DAMPING = 0.2
@@ -39,7 +40,7 @@ def _irb2400_mjcf_path() -> Path:
     return _repo_root() / "models" / "abb_irb2400" / "mjcf" / "irb2400_mjlab.xml"
 
 
-def irb2400_joint_gain_env_cfg_v1(*, play: bool = False) -> ManagerBasedRlEnvCfg:
+def irb2400_ctres_env_cfg(*, play: bool = False) -> ManagerBasedRlEnvCfg:
     mjcf_path = _irb2400_mjcf_path()
     if not mjcf_path.exists():
         raise FileNotFoundError(mjcf_path)
@@ -92,27 +93,33 @@ def irb2400_joint_gain_env_cfg_v1(*, play: bool = False) -> ManagerBasedRlEnvCfg
     }
 
     actions: dict[str, ActionTermCfg] = {
-        "pd_gains": joint_pd_gain_action.JointPdGainActionCfg(
+        "ct_res": JointCtResActionCfg(
             asset_name="robot",
             actuator_names=(".*",),
             command_name="joint_pos",
-            kp_scale=800.0,
-            kp_offset=1000.0,
-            kd_scale=120.0,
-            kd_offset=120.0,
-            clip_kp=(200.0, 2000.0),
-            clip_kd=(10.0, 400.0),
+            kp=928.0596,
+            kd=80.7897,
+            tau_res_limit=0.0,
+            tau_res_slew_rate=300.0,
+            update_period_s=0.02,
+            # Use bias-only feedforward by default: it's cheap enough to run at 2ms and
+            # decouples dynamics evaluation from the NN update period.
+            id_mode="bias",
+            id_scale=1.0,
+            id_limit=800.0,
         )
     }
 
     commands: dict[str, CommandTermCfg] = {
         "joint_pos": joint_sine_command.RandomSineJointPositionCommandCfg(
             asset_name="robot",
-            resampling_time_range=(4.0, 4.0),
+            resampling_time_range=(2.0, 2.0),
             joint_names=(".*",),
             amp_range=(0.15, 0.6),
             freq_range=(0.05, 0.35),
-            phase_range=(-math.pi, math.pi),
+            # Warm start: ensure q_cmd=qd_cmd=qdd_cmd all start at 0 when a new command is sampled.
+            # Random phase can make q_sin(t=0) != 0, which introduces a ramp-time acceleration spike (rddot*q_sin).
+            phase_range=(0.0, 0.0),
             ramp_time=0.5,
             debug_vis=play,
         )
@@ -133,7 +140,7 @@ def irb2400_joint_gain_env_cfg_v1(*, play: bool = False) -> ManagerBasedRlEnvCfg
     rewards = {
         "joint_pos_err_l2": RewardTermCfg(
             func=joint_tracking_rewards.joint_pos_error_l2,
-            weight=-80.0,
+            weight=-180.0,
             params={"command_name": "joint_pos", "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",))},
         ),
         "track_joint_pos": RewardTermCfg(
@@ -184,7 +191,9 @@ def irb2400_joint_gain_env_cfg_v1(*, play: bool = False) -> ManagerBasedRlEnvCfg
     )
 
     return ManagerBasedRlEnvCfg(
-        decimation=5,
+        # Keep RL environment step at 20ms for throughput, while ActionTerm runs every 2ms
+        # inside the env.step() decimation loop (see ManagerBasedRlEnv.step()).
+        decimation=10,
         scene=scene,
         observations=observations,
         actions=actions,
@@ -192,7 +201,7 @@ def irb2400_joint_gain_env_cfg_v1(*, play: bool = False) -> ManagerBasedRlEnvCfg
         events=events,
         rewards=rewards,
         terminations=terminations,
-        episode_length_s=4.0,
+        episode_length_s=2.0,
         sim=sim,
         viewer=ViewerConfig(height=240, width=320),
     )

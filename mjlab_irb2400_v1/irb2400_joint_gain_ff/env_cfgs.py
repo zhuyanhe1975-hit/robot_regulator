@@ -96,18 +96,21 @@ def irb2400_joint_gain_ff_env_cfg_v1(*, play: bool = False) -> ManagerBasedRlEnv
             asset_name="robot",
             actuator_names=(".*",),
             command_name="joint_pos",
-            kp_scale=800.0,
+            # Action mapping: raw in [-1,1] -> physical gains.
+            # kp_raw=1 => kp=4000; kd_raw=1 => kd=1000 (then clipped).
+            kp_scale=3000.0,
             kp_offset=1000.0,
-            kd_scale=120.0,
+            kd_scale=880.0,
             kd_offset=120.0,
-            clip_kp=(200.0, 2000.0),
-            clip_kd=(10.0, 400.0),
+            clip_kp=(200.0, 4000.0),
+            clip_kd=(10.0, 1000.0),
             tau_scale=80.0,
-            tau_limit=120.0,
-            tau_slew_rate=600.0,
+            tau_limit=600.0,
+            tau_slew_rate=3000.0,
             use_inverse_dynamics=True,
             id_scale=1.0,
-            id_limit=800.0,
+            id_limit=4000.0,
+            use_acc_feedforward=False,
         )
     }
 
@@ -139,23 +142,26 @@ def irb2400_joint_gain_ff_env_cfg_v1(*, play: bool = False) -> ManagerBasedRlEnv
     rewards = {
         "joint_pos_err_l2": RewardTermCfg(
             func=joint_tracking_rewards.joint_pos_error_l2,
-            weight=-180.0,
+            # Prioritize tracking accuracy.
+            weight=-600.0,
             params={"command_name": "joint_pos", "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",))},
         ),
         "track_joint_pos": RewardTermCfg(
             func=joint_tracking_rewards.track_joint_pos,
-            weight=1.0,
-            params={"command_name": "joint_pos", "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)), "std": 0.08},
+            # Make reward more sensitive near zero error (smaller std => sharper peak near 0).
+            weight=3.0,
+            params={"command_name": "joint_pos", "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)), "std": 0.02},
         ),
-        "torque_l2": RewardTermCfg(func=joint_torques_l2, weight=-2e-6),
+        # De-prioritize regularization terms; keep them only for logging.
+        "torque_l2": RewardTermCfg(func=joint_torques_l2, weight=0.0),
         "joint_vel_l2": RewardTermCfg(
             func=joint_vel_l2,
-            weight=-5e-3,
+            weight=0.0,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=(".*",))},
         ),
         "joint_acc_l2": RewardTermCfg(
             func=joint_tracking_rewards.joint_acc_l2_clipped,
-            weight=-5e-5,
+            weight=0.0,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)), "clip": 50.0},
         ),
         "joint_pos_limits": RewardTermCfg(
@@ -163,7 +169,7 @@ def irb2400_joint_gain_ff_env_cfg_v1(*, play: bool = False) -> ManagerBasedRlEnv
             weight=-20.0,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=(".*",))},
         ),
-        "action_rate_l2": RewardTermCfg(func=action_rate_l2, weight=-1e-2),
+        "action_rate_l2": RewardTermCfg(func=action_rate_l2, weight=0.0),
     }
 
     terminations = {"time_out": TerminationTermCfg(func=joint_tracking_rewards.time_out, time_out=True)}
@@ -182,7 +188,7 @@ def irb2400_joint_gain_ff_env_cfg_v1(*, play: bool = False) -> ManagerBasedRlEnv
                 get_spec=get_spec,
                 stiffness=250.0,
                 damping=40.0,
-                effort_limit=800.0,
+                effort_limit=4000.0,
                 frictionloss=COULOMB_FRICTION,
             )
         },
@@ -190,7 +196,8 @@ def irb2400_joint_gain_ff_env_cfg_v1(*, play: bool = False) -> ManagerBasedRlEnv
     )
 
     return ManagerBasedRlEnvCfg(
-        decimation=10,
+        # Keep physics timestep at 2ms while updating the policy at 10ms.
+        decimation=5,
         scene=scene,
         observations=observations,
         actions=actions,
@@ -202,4 +209,3 @@ def irb2400_joint_gain_ff_env_cfg_v1(*, play: bool = False) -> ManagerBasedRlEnv
         sim=sim,
         viewer=ViewerConfig(height=240, width=320),
     )
-

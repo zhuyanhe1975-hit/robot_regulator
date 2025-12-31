@@ -1,11 +1,10 @@
 from mjlab.rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
 
 
-def irb2400_joint_gain_ppo_runner_cfg_v1() -> RslRlOnPolicyRunnerCfg:
-    # Matches logs/rsl_rl/irb2400_joint_gain/2025-12-27_23-38-43/params/agent.yaml
+def irb2400_ctres_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
     return RslRlOnPolicyRunnerCfg(
         policy=RslRlPpoActorCriticCfg(
-            init_noise_std=1.0,
+            init_noise_std=0.5,
             actor_obs_normalization=True,
             critic_obs_normalization=True,
             actor_hidden_dims=(256, 256, 128),
@@ -26,10 +25,11 @@ def irb2400_joint_gain_ppo_runner_cfg_v1() -> RslRlOnPolicyRunnerCfg:
             desired_kl=0.01,
             max_grad_norm=1.0,
         ),
-        experiment_name="irb2400_joint_gain",
+        experiment_name="irb2400_ctres",
         logger="tensorboard",
         save_interval=200,
-        # Env step is 10ms (decimation=5, physics=2ms): keep rollout horizon ~0.48s.
-        num_steps_per_env=48,
-        max_iterations=500,
+        # With env.step_dt=20ms (decimation=10), 24 steps ~ 0.48s rollout horizon,
+        # matching the v1 tasks used for the "threeway" baseline.
+        num_steps_per_env=24,
+        max_iterations=3000,
     )

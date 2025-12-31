@@ -12,6 +12,7 @@ from rsl_rl.runners import OnPolicyRunner
 # Register IRB2400 task(s) into mjlab's registry.
 import mjlab_irb2400  # noqa: F401
 import mjlab_irb2400_v1  # noqa: F401
+import mjlab_irb2400_ctres  # noqa: F401
 
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
@@ -122,6 +123,34 @@ def _make_env(
 
     agent_cfg = load_rl_cfg(task_id)
     return RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+
+
+def _resolve_gain_action_layout(env: RslRlVecEnvWrapper) -> tuple[str, int, int]:
+    """Return (term_key, dof, action_dim) for gain-scheduling tasks.
+
+    Supported action layouts:
+    - "pd_gains":    [kp_raw (N), kd_raw (N)]
+    - "pd_gains_ff": [kp_raw (N), kd_raw (N), tau_ff_raw (N)]
+    """
+    cfg_actions = getattr(env.unwrapped.cfg, "actions", {}) or {}
+    if "pd_gains" in cfg_actions:
+        term_key = "pd_gains"
+        blocks = 2
+    elif "pd_gains_ff" in cfg_actions:
+        term_key = "pd_gains_ff"
+        blocks = 3
+    else:
+        raise KeyError(
+            f"Expected action term 'pd_gains' or 'pd_gains_ff', got: {sorted(cfg_actions.keys())}"
+        )
+
+    action_dim = int(env.unwrapped.action_manager.total_action_dim)
+    if action_dim % blocks != 0:
+        raise RuntimeError(
+            f"Invalid action_dim={action_dim} for blocks={blocks} (term={term_key})"
+        )
+    dof = action_dim // blocks
+    return term_key, dof, action_dim
 
 
 def _episode_logs_from_extras(extras: dict[str, Any]) -> dict[str, float]:
@@ -590,7 +619,8 @@ def main() -> None:
                 device=device,
             )
 
-            pd_cfg = trained_env.unwrapped.cfg.actions["pd_gains"]
+            term_key, _, _ = _resolve_gain_action_layout(trained_env)
+            pd_cfg = trained_env.unwrapped.cfg.actions[term_key]
             kp_scale = float(getattr(pd_cfg, "kp_scale"))
             kp_offset = float(getattr(pd_cfg, "kp_offset"))
             kd_scale = float(getattr(pd_cfg, "kd_scale"))
@@ -634,8 +664,7 @@ def main() -> None:
                 video_height=args.video_height,
                 video_width=args.video_width,
             )
-            action_dim = baseline_env.unwrapped.action_manager.total_action_dim
-            dof = action_dim // 2
+            _, dof, action_dim = _resolve_gain_action_layout(baseline_env)
             if baseline_per_joint_kp is None or baseline_per_joint_kd is None:
                 raise RuntimeError("Failed to compute trained_mean baseline gains.")
             if len(baseline_per_joint_kp) != dof or len(baseline_per_joint_kd) != dof:
@@ -656,7 +685,7 @@ def main() -> None:
 
             baseline_action = torch.zeros((baseline_env.num_envs, action_dim), device=device)
             baseline_action[:, :dof] = kp_raw_vec[None, :]
-            baseline_action[:, dof:] = kd_raw_vec[None, :]
+            baseline_action[:, dof : 2 * dof] = kd_raw_vec[None, :]
             baseline_policy = ConstantActionPolicy(baseline_action)
             baseline_logs = _run_eval(
                 env=baseline_env,
@@ -683,7 +712,8 @@ def main() -> None:
                 video_width=args.video_width,
             )
 
-            pd_cfg = baseline_env.unwrapped.cfg.actions["pd_gains"]
+            term_key, dof, action_dim = _resolve_gain_action_layout(baseline_env)
+            pd_cfg = baseline_env.unwrapped.cfg.actions[term_key]
             kp_scale = float(getattr(pd_cfg, "kp_scale"))
             kp_offset = float(getattr(pd_cfg, "kp_offset"))
             kd_scale = float(getattr(pd_cfg, "kd_scale"))
@@ -697,11 +727,9 @@ def main() -> None:
             else:
                 kp_raw, kd_raw = 0.0, 0.0
 
-            action_dim = baseline_env.unwrapped.action_manager.total_action_dim
-            dof = action_dim // 2
             baseline_action = torch.zeros((baseline_env.num_envs, action_dim), device=device)
             baseline_action[:, :dof] = kp_raw
-            baseline_action[:, dof:] = kd_raw
+            baseline_action[:, dof : 2 * dof] = kd_raw
             baseline_policy = ConstantActionPolicy(baseline_action)
 
             baseline_logs = _run_eval(

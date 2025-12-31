@@ -29,7 +29,7 @@ def irb2400_joint_gain_ff_ppo_runner_cfg_v1() -> RslRlOnPolicyRunnerCfg:
         experiment_name="irb2400_joint_gain_ff",
         logger="tensorboard",
         save_interval=200,
-        num_steps_per_env=24,
+        # Env step is 10ms (decimation=5, physics=2ms): keep rollout horizon ~0.48s.
+        num_steps_per_env=48,
         max_iterations=500,
     )
-
