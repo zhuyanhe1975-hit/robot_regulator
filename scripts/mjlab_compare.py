@@ -101,8 +101,9 @@ def _make_env(
     video_length: int,
     video_height: int,
     video_width: int,
+    play: bool = True,
 ) -> RslRlVecEnvWrapper:
-    env_cfg = load_env_cfg(task_id, play=True)
+    env_cfg = load_env_cfg(task_id, play=bool(play))
     env_cfg.seed = seed
     env_cfg.scene.num_envs = num_envs
     env_cfg.viewer.height = video_height
@@ -138,7 +139,9 @@ def _resolve_gain_action_layout(env: RslRlVecEnvWrapper) -> tuple[str, int, int]
         blocks = 2
     elif "pd_gains_ff" in cfg_actions:
         term_key = "pd_gains_ff"
-        blocks = 3
+        term_cfg = cfg_actions[term_key]
+        use_integral = bool(getattr(term_cfg, "use_integral", False))
+        blocks = 4 if use_integral else 3
     else:
         raise KeyError(
             f"Expected action term 'pd_gains' or 'pd_gains_ff', got: {sorted(cfg_actions.keys())}"
@@ -166,6 +169,176 @@ def _episode_logs_from_extras(extras: dict[str, Any]) -> dict[str, float]:
             if v.numel() == 1:
                 out[k] = float(v.item())
     return out
+
+
+def _try_resolve_effort_limit_per_joint(robot, dof: int) -> torch.Tensor | None:  # noqa: ANN001
+    """Best-effort resolve joint torque/effort limit per joint for saturation checks."""
+    # Preferred: read from IdealPdActuator instance if present.
+    try:
+        from mjlab.actuator.pd_actuator import IdealPdActuator  # type: ignore
+
+        for act in getattr(robot, "actuators", []):
+            if isinstance(act, IdealPdActuator):
+                lim = getattr(act, "effort_limit", None)
+                if lim is None:
+                    continue
+                if isinstance(lim, (float, int)):
+                    return torch.full((dof,), float(lim), device=robot.data.joint_pos.device)
+                if isinstance(lim, torch.Tensor):
+                    if lim.numel() == 1:
+                        return torch.full((dof,), float(lim.item()), device=lim.device)
+                    if lim.numel() >= dof:
+                        return lim[:dof].to(device=robot.data.joint_pos.device)
+    except Exception:
+        pass
+
+    # Fallback: see if the robot data exposes a limit tensor.
+    for name in ("joint_effort_limit", "joint_torque_limit", "effort_limit"):
+        lim = getattr(getattr(robot, "data", None), name, None)
+        if isinstance(lim, (float, int)):
+            return torch.full((dof,), float(lim), device=robot.data.joint_pos.device)
+        if isinstance(lim, torch.Tensor):
+            if lim.numel() == 1:
+                return torch.full((dof,), float(lim.item()), device=lim.device)
+            if lim.numel() >= dof:
+                return lim[:dof].to(device=robot.data.joint_pos.device)
+
+    return None
+
+
+def _to_torch_tensor(x: Any) -> torch.Tensor | None:
+    """Best-effort convert mujoco_warp TorchArray or other array-likes into torch.Tensor."""
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        return x
+    for attr in ("tensor", "to_torch", "torch"):
+        v = getattr(x, attr, None)
+        if v is None:
+            continue
+        try:
+            y = v() if callable(v) else v
+        except Exception:
+            continue
+        if isinstance(y, torch.Tensor):
+            return y
+    try:
+        y = torch.as_tensor(x)
+        if isinstance(y, torch.Tensor):
+            return y
+    except Exception:
+        return None
+    return None
+
+
+def _try_resolve_effort_limit_from_model(robot, dof: int) -> torch.Tensor | None:  # noqa: ANN001
+    """Fallback: resolve per-joint effort limits from MuJoCo model actuator force ranges."""
+    model = getattr(getattr(robot, "data", None), "model", None)
+    if model is None:
+        return None
+    fr = getattr(model, "actuator_forcerange", None)
+    fr_t = _to_torch_tensor(fr)
+    if fr_t is None:
+        return None
+    # Expect shape (nu, 2) with min/max. Some wrappers may store (2, nu).
+    if fr_t.ndim != 2 or 2 not in fr_t.shape:
+        return None
+    if fr_t.shape[-1] == 2:
+        lim = torch.max(fr_t.abs(), dim=-1).values
+    else:  # (2, nu)
+        lim = torch.max(fr_t.abs(), dim=0).values
+
+    if lim.numel() == 1:
+        return torch.full((dof,), float(lim.item()), device=robot.data.joint_pos.device)
+    if lim.numel() >= dof:
+        return lim[:dof].to(device=robot.data.joint_pos.device)
+    return None
+
+
+def _try_resolve_effort_limit_from_env_cfg(env: RslRlVecEnvWrapper, dof: int) -> torch.Tensor | None:
+    """Fallback: read actuator effort_limit from the env config (ManagerBasedRlEnvCfg)."""
+    try:
+        entities = getattr(getattr(env.unwrapped.cfg, "scene", None), "entities", None) or {}
+        robot_cfg = entities.get("robot", None)
+        articulation = getattr(robot_cfg, "articulation", None)
+        actuators = getattr(articulation, "actuators", None)
+        if not actuators:
+            return None
+        # Typical IRB2400 config uses one IdealPdActuatorCfg covering all joints.
+        act0 = actuators[0]
+        lim = getattr(act0, "effort_limit", None)
+        if lim is None:
+            return None
+        if isinstance(lim, (float, int)):
+            return torch.full((dof,), float(lim), device=env.unwrapped.scene["robot"].data.joint_pos.device)
+        t = _to_torch_tensor(lim)
+        if t is None:
+            return None
+        if t.numel() == 1:
+            return torch.full((dof,), float(t.item()), device=t.device)
+        if t.numel() >= dof:
+            return t[:dof].to(device=env.unwrapped.scene["robot"].data.joint_pos.device)
+    except Exception:
+        return None
+    return None
+
+
+def debug_torque_fields(env: RslRlVecEnvWrapper) -> None:
+    """Print which torque-related fields are available for saturation diagnostics."""
+    robot = env.unwrapped.scene["robot"]
+    dof = int(robot.data.joint_pos.shape[1])
+    data = robot.data.data
+    idx_v = robot.data.indexing.joint_v_adr[:dof]
+
+    def _describe(name: str) -> str:
+        v = getattr(data, name, None)
+        if v is None:
+            return "missing"
+        t = _to_torch_tensor(v)
+        if t is None:
+            return f"type={type(v).__name__} (no torch conversion)"
+        shape = tuple(t.shape)
+        dtype = str(t.dtype).replace("torch.", "")
+        try:
+            sample = t[:, idx_v]
+            sample_shape = tuple(sample.shape)
+        except Exception:
+            sample_shape = None
+        return f"type={type(v).__name__} torch_shape={shape} dtype={dtype} sel_shape={sample_shape}"
+
+    print("[DEBUG] torque fields on robot.data.data:", flush=True)
+    for name in (
+        "qfrc_actuator",
+        "qfrc_bias",
+        "qfrc_applied",
+        "qfrc_passive",
+        "qfrc_constraint",
+        "qfrc_inverse",
+        "actuator_force",
+        "ctrl",
+    ):
+        print(f"  - {name}: {_describe(name)}", flush=True)
+
+    lim = (
+        _try_resolve_effort_limit_per_joint(robot, dof)
+        or _try_resolve_effort_limit_from_model(robot, dof)
+        or _try_resolve_effort_limit_from_env_cfg(env, dof)
+    )
+    if lim is None:
+        print("  - effort_limit: unresolved (actuator + model + env_cfg)", flush=True)
+    else:
+        print(
+            f"  - effort_limit: tensor shape={tuple(lim.shape)} min={float(lim.min().item()):.3f} max={float(lim.max().item()):.3f}",
+            flush=True,
+        )
+
+    cfg_actions = getattr(env.unwrapped.cfg, "actions", {}) or {}
+    if "pd_gains_ff" in cfg_actions:
+        cfg = cfg_actions["pd_gains_ff"]
+        tau_limit = float(getattr(cfg, "tau_limit", float("inf")))
+        id_limit = float(getattr(cfg, "id_limit", float("inf")))
+        print(f"  - cfg.tau_limit: {tau_limit}", flush=True)
+        print(f"  - cfg.id_limit: {id_limit}", flush=True)
 
 
 def _run_eval(
@@ -300,6 +473,54 @@ def _run_eval(
         torque_steps = 0
         torque_abs_sum = torque_abs_max = None
 
+    # Torque stats for GainFF tasks: total applied torque (qfrc_actuator) + ID component saturation.
+    total_tau_steps = 0
+    total_tau_abs_sum = total_tau_abs_max = None
+    total_tau_sq_sum = None
+    total_tau_sat_cnt = total_tau_sat_per_joint_cnt = None
+    total_tau_sat_denom = None
+    id_tau_steps = 0
+    id_tau_abs_sum = id_tau_abs_max = None
+    id_tau_sq_sum = None
+    id_tau_sat_cnt = id_tau_sat_per_joint_cnt = None
+    id_tau_sat_denom = None
+    ff_tau_sq_sum = None
+
+    # Alignment stats between components and total torque.
+    ff_align_steps = 0
+    ff_total_sum = ff_total_sq_sum = ff_comp_sum = ff_comp_sq_sum = ff_dot_sum = None
+    id_align_steps = 0
+    id_total_sum = id_total_sq_sum = id_comp_sum = id_comp_sq_sum = id_dot_sum = None
+    if has_pd_gains_ff:
+        assert dof is not None
+        total_tau_abs_sum = torch.zeros((env.num_envs, dof), device=device)
+        total_tau_abs_max = torch.zeros_like(total_tau_abs_sum)
+        total_tau_sq_sum = torch.zeros_like(total_tau_abs_sum)
+        total_tau_sat_cnt = torch.zeros((env.num_envs, 1), device=device)
+        total_tau_sat_per_joint_cnt = torch.zeros((env.num_envs, dof), device=device)
+        total_tau_sat_denom = torch.zeros((env.num_envs, 1), device=device)
+
+        id_tau_abs_sum = torch.zeros((env.num_envs, dof), device=device)
+        id_tau_abs_max = torch.zeros_like(id_tau_abs_sum)
+        id_tau_sq_sum = torch.zeros_like(id_tau_abs_sum)
+        id_tau_sat_cnt = torch.zeros((env.num_envs, 1), device=device)
+        id_tau_sat_per_joint_cnt = torch.zeros((env.num_envs, dof), device=device)
+        id_tau_sat_denom = torch.zeros((env.num_envs, 1), device=device)
+
+        ff_tau_sq_sum = torch.zeros((env.num_envs, dof), device=device)
+
+        ff_total_sum = torch.zeros((env.num_envs, dof), device=device)
+        ff_total_sq_sum = torch.zeros_like(ff_total_sum)
+        ff_comp_sum = torch.zeros_like(ff_total_sum)
+        ff_comp_sq_sum = torch.zeros_like(ff_total_sum)
+        ff_dot_sum = torch.zeros_like(ff_total_sum)
+
+        id_total_sum = torch.zeros((env.num_envs, dof), device=device)
+        id_total_sq_sum = torch.zeros_like(id_total_sum)
+        id_comp_sum = torch.zeros_like(id_total_sum)
+        id_comp_sq_sum = torch.zeros_like(id_total_sum)
+        id_dot_sum = torch.zeros_like(id_total_sum)
+
     for _ in range(episodes):
         # Run exactly one full episode worth of steps; env auto-resets on time_out.
         for _step in range(env.max_episode_length):
@@ -353,6 +574,7 @@ def _run_eval(
             if (_step % update_every_env_steps) == 0:
                 held_action_for_stats = actions.clone()
             a = torch.clamp(held_action_for_stats, -1.0, 1.0)
+            ff_tau_for_align = None
             if has_pd_gains:
                 assert dof is not None
                 kp_raw = a[:, :dof]
@@ -390,9 +612,12 @@ def _run_eval(
                     tau_scale = float(getattr(pd_cfg, "tau_scale", 1.0))
                     tau_limit = float(getattr(pd_cfg, "tau_limit", float("inf")))
                     tau_ff = torch.clamp(tau_raw * tau_scale, -tau_limit, tau_limit)
+                    ff_tau_for_align = tau_ff
                     abs_tau = torch.abs(tau_ff)
                     ff_tau_abs_sum += abs_tau
                     ff_tau_abs_max = torch.maximum(ff_tau_abs_max, abs_tau)
+                    assert ff_tau_sq_sum is not None
+                    ff_tau_sq_sum += tau_ff * tau_ff
                     ff_tau_steps += 1
                 elif a.shape[1] == 4 * dof:
                     a_raw = a[:, 2 * dof : 3 * dof]
@@ -407,9 +632,12 @@ def _run_eval(
                     sign = torch.tanh(qd / sign_eps)
                     tau_res = a_mag * sign + b_mag * qd
                     tau_res = torch.clamp(tau_res, -tau_limit, tau_limit)
+                    ff_tau_for_align = tau_res
                     abs_tau = torch.abs(tau_res)
                     ff_tau_abs_sum += abs_tau
                     ff_tau_abs_max = torch.maximum(ff_tau_abs_max, abs_tau)
+                    assert ff_tau_sq_sum is not None
+                    ff_tau_sq_sum += tau_res * tau_res
                     ff_tau_steps += 1
                 else:
                     # Unknown layout; skip FF magnitude metrics (keep gain stats).
@@ -422,6 +650,91 @@ def _run_eval(
                 torque_abs_sum += abs_tau
                 torque_abs_max = torch.maximum(torque_abs_max, abs_tau)
                 torque_steps += 1
+
+            # Total torque + ID component (GainFF tasks).
+            if has_pd_gains_ff and _step >= skip_steps:
+                assert dof is not None
+                pd_cfg = env.unwrapped.cfg.actions["pd_gains_ff"]
+
+                data = robot.data.data
+                idx_v = robot.data.indexing.joint_v_adr[:dof]
+
+                # Total actuator generalized forces applied by MuJoCo.
+                qfrc_actuator = getattr(data, "qfrc_actuator", None)
+                qfrc_actuator_t = _to_torch_tensor(qfrc_actuator)
+                if qfrc_actuator_t is not None:
+                    tau_total = qfrc_actuator_t[:, idx_v]
+                    abs_total = torch.abs(tau_total)
+                    assert total_tau_abs_sum is not None and total_tau_abs_max is not None
+                    total_tau_abs_sum += abs_total
+                    total_tau_abs_max = torch.maximum(total_tau_abs_max, abs_total)
+                    assert total_tau_sq_sum is not None
+                    total_tau_sq_sum += tau_total * tau_total
+                    total_tau_steps += 1
+
+                    lim = (
+                        _try_resolve_effort_limit_per_joint(robot, dof)
+                        or _try_resolve_effort_limit_from_model(robot, dof)
+                        or _try_resolve_effort_limit_from_env_cfg(env, dof)
+                    )
+                    if lim is not None:
+                        th = 0.98 * lim.view(1, -1)
+                        sat = abs_total >= th
+                        assert total_tau_sat_cnt is not None
+                        assert total_tau_sat_per_joint_cnt is not None
+                        assert total_tau_sat_denom is not None
+                        total_tau_sat_per_joint_cnt += sat.to(dtype=abs_total.dtype)
+                        total_tau_sat_cnt += sat.any(dim=-1, keepdim=True).to(dtype=abs_total.dtype)
+                        total_tau_sat_denom += 1.0
+
+                # ID component from qfrc_bias (matches action term).
+                qfrc_bias = getattr(data, "qfrc_bias", None)
+                qfrc_bias_t = _to_torch_tensor(qfrc_bias)
+                tau_id_for_align = None
+                if qfrc_bias_t is not None:
+                    tau_id = qfrc_bias_t[:, idx_v] * float(getattr(pd_cfg, "id_scale", 1.0))
+                    id_limit = float(getattr(pd_cfg, "id_limit", float("inf")))
+                    tau_id = torch.clamp(tau_id, -id_limit, id_limit)
+                    tau_id_for_align = tau_id
+                    abs_id = torch.abs(tau_id)
+                    assert id_tau_abs_sum is not None and id_tau_abs_max is not None
+                    id_tau_abs_sum += abs_id
+                    id_tau_abs_max = torch.maximum(id_tau_abs_max, abs_id)
+                    assert id_tau_sq_sum is not None
+                    id_tau_sq_sum += tau_id * tau_id
+                    id_tau_steps += 1
+
+                    if id_limit < float("inf"):
+                        sat = abs_id >= (0.98 * id_limit)
+                        assert id_tau_sat_cnt is not None
+                        assert id_tau_sat_per_joint_cnt is not None
+                        assert id_tau_sat_denom is not None
+                        id_tau_sat_per_joint_cnt += sat.to(dtype=abs_id.dtype)
+                        id_tau_sat_cnt += sat.any(dim=-1, keepdim=True).to(dtype=abs_id.dtype)
+                        id_tau_sat_denom += 1.0
+
+                # Alignment: projection/correlation of components onto the actual total torque.
+                if qfrc_actuator_t is not None:
+                    if ff_tau_for_align is not None:
+                        assert ff_total_sum is not None and ff_total_sq_sum is not None
+                        assert ff_comp_sum is not None and ff_comp_sq_sum is not None
+                        assert ff_dot_sum is not None
+                        ff_total_sum += tau_total
+                        ff_total_sq_sum += tau_total * tau_total
+                        ff_comp_sum += ff_tau_for_align
+                        ff_comp_sq_sum += ff_tau_for_align * ff_tau_for_align
+                        ff_dot_sum += tau_total * ff_tau_for_align
+                        ff_align_steps += 1
+                    if tau_id_for_align is not None:
+                        assert id_total_sum is not None and id_total_sq_sum is not None
+                        assert id_comp_sum is not None and id_comp_sq_sum is not None
+                        assert id_dot_sum is not None
+                        id_total_sum += tau_total
+                        id_total_sq_sum += tau_total * tau_total
+                        id_comp_sum += tau_id_for_align
+                        id_comp_sq_sum += tau_id_for_align * tau_id_for_align
+                        id_dot_sum += tau_total * tau_id_for_align
+                        id_align_steps += 1
 
             # All envs time out together in this task; treat as episode boundary.
             if int(dones.sum().item()) == env.num_envs:
@@ -478,6 +791,102 @@ def _run_eval(
                     ep["FF/abs_max_mean"] = float(tau_abs_max_mean.mean().item())
                     ep["FF/per_joint_abs_mean"] = [float(x) for x in tau_abs_mean.tolist()]
                     ep["FF/per_joint_abs_max"] = [float(x) for x in tau_abs_max_mean.tolist()]
+                    assert ff_tau_sq_sum is not None
+                    ff_rms = torch.sqrt((ff_tau_sq_sum / float(ff_tau_steps)).mean(dim=0))
+                    ep["FF/rms_mean"] = float(ff_rms.mean().item())
+                    ep["FF/per_joint_rms"] = [float(x) for x in ff_rms.tolist()]
+                    try:
+                        tau_limit = float(getattr(pd_cfg, "tau_limit", float("inf")))
+                        if tau_limit < float("inf"):
+                            sat = tau_abs_max_mean >= (0.98 * tau_limit)
+                            ep["FF/sat_any_frac"] = float(sat.to(dtype=torch.float32).mean().item())
+                    except Exception:
+                        pass
+
+                if id_tau_steps > 0:
+                    assert id_tau_abs_sum is not None and id_tau_abs_max is not None
+                    tau_abs_mean = (id_tau_abs_sum / float(id_tau_steps)).mean(dim=0)
+                    tau_abs_max_mean = id_tau_abs_max.mean(dim=0)
+                    ep["ID/abs_mean"] = float(tau_abs_mean.mean().item())
+                    ep["ID/abs_max_mean"] = float(tau_abs_max_mean.mean().item())
+                    ep["ID/per_joint_abs_mean"] = [float(x) for x in tau_abs_mean.tolist()]
+                    ep["ID/per_joint_abs_max"] = [float(x) for x in tau_abs_max_mean.tolist()]
+                    assert id_tau_sq_sum is not None
+                    id_rms = torch.sqrt((id_tau_sq_sum / float(id_tau_steps)).mean(dim=0))
+                    ep["ID/rms_mean"] = float(id_rms.mean().item())
+                    ep["ID/per_joint_rms"] = [float(x) for x in id_rms.tolist()]
+                    if id_tau_sat_denom is not None and float(id_tau_sat_denom.mean().item()) > 0.0:
+                        assert id_tau_sat_cnt is not None and id_tau_sat_per_joint_cnt is not None
+                        denom = id_tau_sat_denom
+                        ep["ID/sat_frac"] = float((id_tau_sat_cnt / denom).mean().item())
+                        per_joint = (id_tau_sat_per_joint_cnt / denom).mean(dim=0)
+                        ep["ID/per_joint_sat_frac"] = [float(x) for x in per_joint.tolist()]
+
+                if total_tau_steps > 0:
+                    assert total_tau_abs_sum is not None and total_tau_abs_max is not None
+                    tau_abs_mean = (total_tau_abs_sum / float(total_tau_steps)).mean(dim=0)
+                    tau_abs_max_mean = total_tau_abs_max.mean(dim=0)
+                    ep["TorqueTotal/abs_mean"] = float(tau_abs_mean.mean().item())
+                    ep["TorqueTotal/abs_max_mean"] = float(tau_abs_max_mean.mean().item())
+                    ep["TorqueTotal/per_joint_abs_mean"] = [float(x) for x in tau_abs_mean.tolist()]
+                    ep["TorqueTotal/per_joint_abs_max"] = [float(x) for x in tau_abs_max_mean.tolist()]
+                    assert total_tau_sq_sum is not None
+                    total_rms = torch.sqrt((total_tau_sq_sum / float(total_tau_steps)).mean(dim=0))
+                    ep["TorqueTotal/rms_mean"] = float(total_rms.mean().item())
+                    ep["TorqueTotal/per_joint_rms"] = [float(x) for x in total_rms.tolist()]
+                    if total_tau_sat_denom is not None and float(total_tau_sat_denom.mean().item()) > 0.0:
+                        assert total_tau_sat_cnt is not None and total_tau_sat_per_joint_cnt is not None
+                        denom = total_tau_sat_denom
+                        ep["TorqueTotal/sat_frac"] = float((total_tau_sat_cnt / denom).mean().item())
+                        per_joint = (total_tau_sat_per_joint_cnt / denom).mean(dim=0)
+                        ep["TorqueTotal/per_joint_sat_frac"] = [float(x) for x in per_joint.tolist()]
+
+                # Alignment stats: projection and correlation between components and total torque.
+                eps = 1e-12
+                if ff_align_steps > 0 and ff_total_sum is not None and ff_total_sq_sum is not None:
+                    assert ff_comp_sum is not None and ff_comp_sq_sum is not None and ff_dot_sum is not None
+                    t_mean = (ff_total_sum / float(ff_align_steps)).mean(dim=0)
+                    t2_mean = (ff_total_sq_sum / float(ff_align_steps)).mean(dim=0)
+                    f_mean = (ff_comp_sum / float(ff_align_steps)).mean(dim=0)
+                    f2_mean = (ff_comp_sq_sum / float(ff_align_steps)).mean(dim=0)
+                    tf_mean = (ff_dot_sum / float(ff_align_steps)).mean(dim=0)
+                    t_var = torch.clamp(t2_mean - t_mean * t_mean, min=0.0)
+                    f_var = torch.clamp(f2_mean - f_mean * f_mean, min=0.0)
+                    cov = tf_mean - t_mean * f_mean
+                    corr = cov / torch.sqrt(t_var * f_var + eps)
+                    proj = tf_mean / (t2_mean + eps)
+                    ep["FF/proj_to_total_mean"] = float(proj.mean().item())
+                    ep["FF/per_joint_proj_to_total"] = [float(x) for x in proj.tolist()]
+                    ep["FF/corr_with_total_mean"] = float(corr.mean().item())
+                    ep["FF/per_joint_corr_with_total"] = [float(x) for x in corr.tolist()]
+
+                if id_align_steps > 0 and id_total_sum is not None and id_total_sq_sum is not None:
+                    assert id_comp_sum is not None and id_comp_sq_sum is not None and id_dot_sum is not None
+                    t_mean = (id_total_sum / float(id_align_steps)).mean(dim=0)
+                    t2_mean = (id_total_sq_sum / float(id_align_steps)).mean(dim=0)
+                    i_mean = (id_comp_sum / float(id_align_steps)).mean(dim=0)
+                    i2_mean = (id_comp_sq_sum / float(id_align_steps)).mean(dim=0)
+                    ti_mean = (id_dot_sum / float(id_align_steps)).mean(dim=0)
+                    t_var = torch.clamp(t2_mean - t_mean * t_mean, min=0.0)
+                    i_var = torch.clamp(i2_mean - i_mean * i_mean, min=0.0)
+                    cov = ti_mean - t_mean * i_mean
+                    corr = cov / torch.sqrt(t_var * i_var + eps)
+                    proj = ti_mean / (t2_mean + eps)
+                    ep["ID/proj_to_total_mean"] = float(proj.mean().item())
+                    ep["ID/per_joint_proj_to_total"] = [float(x) for x in proj.tolist()]
+                    ep["ID/corr_with_total_mean"] = float(corr.mean().item())
+                    ep["ID/per_joint_corr_with_total"] = [float(x) for x in corr.tolist()]
+
+                # RMS ratios vs total RMS.
+                if total_tau_steps > 0 and total_tau_sq_sum is not None:
+                    total_rms = torch.sqrt((total_tau_sq_sum / float(total_tau_steps)).mean(dim=0))
+                    denom = float(total_rms.mean().item()) + 1e-12
+                    if ff_tau_steps > 0 and ff_tau_sq_sum is not None:
+                        ff_rms = torch.sqrt((ff_tau_sq_sum / float(ff_tau_steps)).mean(dim=0))
+                        ep["FF/rms_ratio_to_total"] = float(ff_rms.mean().item() / denom)
+                    if id_tau_steps > 0 and id_tau_sq_sum is not None:
+                        id_rms = torch.sqrt((id_tau_sq_sum / float(id_tau_steps)).mean(dim=0))
+                        ep["ID/rms_ratio_to_total"] = float(id_rms.mean().item() / denom)
 
                 if torque_steps > 0:
                     assert torque_abs_sum is not None and torque_abs_max is not None
@@ -515,6 +924,57 @@ def _run_eval(
                     assert ff_tau_abs_sum is not None and ff_tau_abs_max is not None
                     ff_tau_abs_sum.zero_()
                     ff_tau_abs_max.zero_()
+                    if ff_tau_sq_sum is not None:
+                        ff_tau_sq_sum.zero_()
+                    ff_align_steps = 0
+                    if ff_total_sum is not None:
+                        ff_total_sum.zero_()
+                    if ff_total_sq_sum is not None:
+                        ff_total_sq_sum.zero_()
+                    if ff_comp_sum is not None:
+                        ff_comp_sum.zero_()
+                    if ff_comp_sq_sum is not None:
+                        ff_comp_sq_sum.zero_()
+                    if ff_dot_sum is not None:
+                        ff_dot_sum.zero_()
+
+                    id_align_steps = 0
+                    if id_total_sum is not None:
+                        id_total_sum.zero_()
+                    if id_total_sq_sum is not None:
+                        id_total_sq_sum.zero_()
+                    if id_comp_sum is not None:
+                        id_comp_sum.zero_()
+                    if id_comp_sq_sum is not None:
+                        id_comp_sq_sum.zero_()
+                    if id_dot_sum is not None:
+                        id_dot_sum.zero_()
+                    total_tau_steps = 0
+                    id_tau_steps = 0
+                    if total_tau_abs_sum is not None:
+                        total_tau_abs_sum.zero_()
+                    if total_tau_abs_max is not None:
+                        total_tau_abs_max.zero_()
+                    if total_tau_sq_sum is not None:
+                        total_tau_sq_sum.zero_()
+                    if total_tau_sat_cnt is not None:
+                        total_tau_sat_cnt.zero_()
+                    if total_tau_sat_per_joint_cnt is not None:
+                        total_tau_sat_per_joint_cnt.zero_()
+                    if total_tau_sat_denom is not None:
+                        total_tau_sat_denom.zero_()
+                    if id_tau_abs_sum is not None:
+                        id_tau_abs_sum.zero_()
+                    if id_tau_abs_max is not None:
+                        id_tau_abs_max.zero_()
+                    if id_tau_sq_sum is not None:
+                        id_tau_sq_sum.zero_()
+                    if id_tau_sat_cnt is not None:
+                        id_tau_sat_cnt.zero_()
+                    if id_tau_sat_per_joint_cnt is not None:
+                        id_tau_sat_per_joint_cnt.zero_()
+                    if id_tau_sat_denom is not None:
+                        id_tau_sat_denom.zero_()
 
                 torque_steps = 0
                 if has_torque_action:

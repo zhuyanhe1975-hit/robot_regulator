@@ -131,7 +131,10 @@ class RandomSineJointPositionCommand(CommandTerm):
         self._cmd_acc[env_ids][:, self._joint_ids] = qdd_cmd
 
     def _update_command(self) -> None:
-        self._t += self._env.step_dt
+        # CommandTerm is updated inside the env.step() decimation loop; use physics_dt so the
+        # reference trajectory (q, qd, qdd) is available at the 2ms inner-loop rate.
+        dt = float(getattr(self._env, "physics_dt", 0.0)) or float(self._env.step_dt)
+        self._t += dt
         self._write_command()
 
 

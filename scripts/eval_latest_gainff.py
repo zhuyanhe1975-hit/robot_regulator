@@ -70,6 +70,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--video-length", type=int, default=600)
     p.add_argument("--video-height", type=int, default=480)
     p.add_argument("--video-width", type=int, default=640)
+    p.add_argument(
+        "--env-mode",
+        type=str,
+        default="play",
+        choices=["play", "train"],
+        help="Use play env cfg (no observation corruption) or train env cfg (corruption enabled).",
+    )
+    p.add_argument(
+        "--debug-torque-fields",
+        action="store_true",
+        help="Print which MuJoCo/mujoco_warp torque fields are available (qfrc_actuator/qfrc_bias/etc).",
+    )
     return p.parse_args()
 
 
@@ -128,7 +140,21 @@ def main() -> None:
             video_length=int(args.video_length),
             video_height=int(args.video_height),
             video_width=int(args.video_width),
+            play=(args.env_mode == "play"),
         )
+        try:
+            policy_obs_group = env.unwrapped.cfg.observations.get("policy")
+            policy_corruption = bool(getattr(policy_obs_group, "enable_corruption", False))
+        except Exception:
+            policy_corruption = False
+        print(
+            f"[INFO] env_mode={args.env_mode} play={args.env_mode == 'play'} "
+            f"policy_enable_corruption={policy_corruption} "
+            f"physics_dt={env.unwrapped.physics_dt:.4f}s step_dt={env.unwrapped.step_dt:.4f}s",
+            flush=True,
+        )
+        if args.debug_torque_fields:
+            mc.debug_torque_fields(env)
         policy = mc._load_trained_policy(task_id=args.task, checkpoint=ckpt, env=env, device=device)
         logs = mc._run_eval(
             env=env,
@@ -163,7 +189,9 @@ def main() -> None:
     print(f"[OK] wrote: {out_path}")
     print("\nSummary (selected):")
     for k in sorted(payload["summary"].keys()):
-        if k.endswith("/mean") and any(s in k for s in ("JointError", "EEError", "Episode_Reward", "Gain")):
+        if k.endswith("/mean") and any(
+            s in k for s in ("JointError", "EEError", "Episode_Reward", "Gain", "Torque", "FF", "ID")
+        ):
             print(f"  {k}: {payload['summary'][k]:.4f}")
 
     if args.viewer:

@@ -18,7 +18,9 @@ if TYPE_CHECKING:
 class JointPdGainFfActionV1(ActionTerm):
     """V1: variable-gain PD + inverse-dynamics bias + direct torque feedforward.
 
-    Policy action = [kp_raw (N), kd_raw (N), tau_ff_raw (N)] in [-1,1].
+    Policy action:
+    - default: [kp_raw (N), kd_raw (N), tau_ff_raw (N)] in [-1,1].
+    - with integral enabled: [kp_raw (N), kd_raw (N), ki_raw (N), tau_ff_raw (N)] in [-1,1].
     """
 
     cfg: "JointPdGainFfActionV1Cfg"
@@ -32,13 +34,16 @@ class JointPdGainFfActionV1(ActionTerm):
         self._joint_names = joint_names
         self._num_joints = len(joint_ids)
 
-        self._action_dim = 3 * self._num_joints
+        self._use_integral = bool(getattr(cfg, "use_integral", False))
+        self._action_dim = (4 if self._use_integral else 3) * self._num_joints
         self._raw_actions = torch.zeros(self.num_envs, self.action_dim, device=self.device)
         self._prev_cmd = torch.zeros(self.num_envs, self._num_joints, device=self.device)
         self._prev_tau_ff = torch.zeros(self.num_envs, self._num_joints, device=self.device)
         self._tau_acc_hold = torch.zeros(self.num_envs, self._num_joints, device=self.device)
         self._physics_step = 0
         self._warned_acc = False
+        self._i_state = torch.zeros(self.num_envs, self._num_joints, device=self.device)
+        self._prev_tau_i = torch.zeros(self.num_envs, self._num_joints, device=self.device)
 
         self._acc_update_steps = 1
         if float(getattr(cfg, "acc_update_period_s", 0.0)) > 0.0:
@@ -68,10 +73,14 @@ class JointPdGainFfActionV1(ActionTerm):
         if isinstance(env_ids, slice) and env_ids == slice(None):
             self._prev_cmd[:] = cmd[:, self._joint_ids]
             self._prev_tau_ff.zero_()
+            self._i_state.zero_()
+            self._prev_tau_i.zero_()
         else:
             self._prev_cmd[env_ids] = cmd[env_ids][:, self._joint_ids]
             self._prev_tau_ff[env_ids] = 0.0
             self._tau_acc_hold[env_ids] = 0.0
+            self._i_state[env_ids] = 0.0
+            self._prev_tau_i[env_ids] = 0.0
 
     def process_actions(self, actions: torch.Tensor) -> None:
         self._raw_actions[:] = actions
@@ -98,12 +107,47 @@ class JointPdGainFfActionV1(ActionTerm):
         a = torch.clamp(self._raw_actions, -1.0, 1.0)
         kp_raw = a[:, : self._num_joints]
         kd_raw = a[:, self._num_joints : 2 * self._num_joints]
-        tau_raw = a[:, 2 * self._num_joints :]
+        if self._use_integral:
+            ki_raw = a[:, 2 * self._num_joints : 3 * self._num_joints]
+            tau_raw = a[:, 3 * self._num_joints :]
+        else:
+            ki_raw = None
+            tau_raw = a[:, 2 * self._num_joints :]
 
         kp = torch.clamp(kp_raw * self.cfg.kp_scale + self.cfg.kp_offset, *self.cfg.clip_kp)
         kd = torch.clamp(kd_raw * self.cfg.kd_scale + self.cfg.kd_offset, *self.cfg.clip_kd)
         assert self._pd_act is not None
         self._pd_act.set_gains(slice(None), kp=kp, kd=kd)
+
+        tau_i = torch.zeros((self.num_envs, self._num_joints), device=self.device)
+        if self._use_integral and ki_raw is not None:
+            ki = torch.clamp(
+                ki_raw * float(getattr(self.cfg, "ki_scale")) + float(getattr(self.cfg, "ki_offset")),
+                *getattr(self.cfg, "clip_ki"),
+            )
+            q = self._asset.data.joint_pos[:, self._joint_ids]
+            e = pos_target - q
+            dt_i = float(self._env.physics_dt)
+            leak = float(getattr(self.cfg, "i_leak", 0.0))
+            if leak > 0.0:
+                self._i_state = self._i_state * max(0.0, 1.0 - leak * dt_i)
+            self._i_state = self._i_state + e * dt_i
+            i_lim = float(getattr(self.cfg, "i_limit", 0.0))
+            if i_lim > 0.0:
+                self._i_state = torch.clamp(self._i_state, -i_lim, i_lim)
+
+            tau_i = ki * self._i_state
+            tau_i_limit = float(getattr(self.cfg, "tau_i_limit", 0.0))
+            if tau_i_limit > 0.0:
+                tau_i = torch.clamp(tau_i, -tau_i_limit, tau_i_limit)
+
+            # Optional slew-rate limiting for integral torque to avoid sudden kick.
+            tau_i_slew = float(getattr(self.cfg, "tau_i_slew_rate", 0.0))
+            if tau_i_slew > 0.0:
+                max_delta_i = tau_i_slew * float(self._env.physics_dt)
+                delta_i = torch.clamp(tau_i - self._prev_tau_i, -max_delta_i, max_delta_i)
+                tau_i = self._prev_tau_i + delta_i
+            self._prev_tau_i = tau_i.detach()
 
         # Direct torque feedforward from policy (slew-rate limited).
         tau_ff = tau_raw * float(self.cfg.tau_scale)
@@ -128,7 +172,7 @@ class JointPdGainFfActionV1(ActionTerm):
                 self._tau_acc_hold = self._acc_feedforward(qdd_ref).detach()
             tau_acc = self._tau_acc_hold
 
-        self._asset.set_joint_effort_target(tau_id + tau_acc + tau_ff, joint_ids=self._joint_ids)
+        self._asset.set_joint_effort_target(tau_id + tau_acc + tau_i + tau_ff, joint_ids=self._joint_ids)
 
     def _bias_feedforward(self) -> torch.Tensor:
         if not self.cfg.use_inverse_dynamics:
@@ -232,6 +276,16 @@ class JointPdGainFfActionV1Cfg(ActionTermCfg):
     use_inverse_dynamics: bool = True
     id_scale: float = 1.0
     id_limit: float = 800.0
+
+    # Optional integral action (policy outputs ki per joint).
+    use_integral: bool = False
+    ki_scale: float = 200.0
+    ki_offset: float = 0.0
+    clip_ki: tuple[float, float] = (0.0, 200.0)
+    i_limit: float = 0.2  # clamp on integral state (rad*s)
+    i_leak: float = 0.0   # leaky integrator (1/s)
+    tau_i_limit: float = 200.0  # clamp on integral torque (Nm)
+    tau_i_slew_rate: float = 0.0  # Nm/s, 0 disables slew limiting
 
     # Acceleration feedforward (M(q) qdd_ref) computed via inverse dynamics and held.
     use_acc_feedforward: bool = False

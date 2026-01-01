@@ -39,7 +39,7 @@ def _irb2400_mjcf_path() -> Path:
     return _repo_root() / "models" / "abb_irb2400" / "mjcf" / "irb2400_mjlab.xml"
 
 
-def irb2400_joint_gain_ff_env_cfg_v1(*, play: bool = False) -> ManagerBasedRlEnvCfg:
+def irb2400_joint_gain_ff_env_cfg_v1(*, play: bool = False, use_integral: bool = False) -> ManagerBasedRlEnvCfg:
     mjcf_path = _irb2400_mjcf_path()
     if not mjcf_path.exists():
         raise FileNotFoundError(mjcf_path)
@@ -97,20 +97,26 @@ def irb2400_joint_gain_ff_env_cfg_v1(*, play: bool = False) -> ManagerBasedRlEnv
             actuator_names=(".*",),
             command_name="joint_pos",
             # Action mapping: raw in [-1,1] -> physical gains.
-            # kp_raw=1 => kp=4000; kd_raw=1 => kd=1000 (then clipped).
-            kp_scale=3000.0,
+            # kp_raw=1 => kp=8000; kd_raw=1 => kd=2000 (then clipped).
+            kp_scale=7000.0,
             kp_offset=1000.0,
-            kd_scale=880.0,
+            kd_scale=1880.0,
             kd_offset=120.0,
-            clip_kp=(200.0, 4000.0),
-            clip_kd=(10.0, 1000.0),
-            tau_scale=80.0,
-            tau_limit=600.0,
-            tau_slew_rate=3000.0,
+            clip_kp=(200.0, 8000.0),
+            clip_kd=(10.0, 2000.0),
+            tau_scale=160.0,
+            tau_limit=1200.0,
+            tau_slew_rate=6000.0,
             use_inverse_dynamics=True,
             id_scale=1.0,
-            id_limit=4000.0,
-            use_acc_feedforward=False,
+            id_limit=8000.0,
+            use_integral=use_integral,
+            # Acceleration feedforward (M(q) qdd_ref) computed every 10ms and held (ZOH).
+            use_acc_feedforward=True,
+            # With command_acc available at 2ms, compute acc FF every physics step.
+            acc_update_period_s=0.0,
+            acc_scale=0.2,
+            acc_limit=8000.0,
         )
     }
 
@@ -140,17 +146,32 @@ def irb2400_joint_gain_ff_env_cfg_v1(*, play: bool = False) -> ManagerBasedRlEnv
     }
 
     rewards = {
+        # Optimize end-effector tracking accuracy (world position) w.r.t. the reference joint command.
+        "ee_pos_err_l2": RewardTermCfg(
+            func=joint_tracking_rewards.ee_pos_error_l2_from_joint_command,
+            weight=-500.0,  # m^2 scale
+            params={"command_name": "joint_pos", "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)), "site_name": "ee"},
+        ),
+        "track_ee_pos": RewardTermCfg(
+            func=joint_tracking_rewards.track_ee_pos_from_joint_command,
+            weight=1.0,
+            params={
+                "command_name": "joint_pos",
+                "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)),
+                "site_name": "ee",
+                "std": 0.005,  # 5mm
+            },
+        ),
+        # Keep joint tracking terms for logging only.
         "joint_pos_err_l2": RewardTermCfg(
             func=joint_tracking_rewards.joint_pos_error_l2,
-            # Prioritize tracking accuracy.
-            weight=-600.0,
+            weight=-100.0,
             params={"command_name": "joint_pos", "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",))},
         ),
         "track_joint_pos": RewardTermCfg(
             func=joint_tracking_rewards.track_joint_pos,
-            # Make reward more sensitive near zero error (smaller std => sharper peak near 0).
-            weight=3.0,
-            params={"command_name": "joint_pos", "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)), "std": 0.02},
+            weight=1.0,
+            params={"command_name": "joint_pos", "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)), "std": 0.01},
         ),
         # De-prioritize regularization terms; keep them only for logging.
         "torque_l2": RewardTermCfg(func=joint_torques_l2, weight=0.0),
@@ -188,7 +209,7 @@ def irb2400_joint_gain_ff_env_cfg_v1(*, play: bool = False) -> ManagerBasedRlEnv
                 get_spec=get_spec,
                 stiffness=250.0,
                 damping=40.0,
-                effort_limit=4000.0,
+                effort_limit=8000.0,
                 frictionloss=COULOMB_FRICTION,
             )
         },
